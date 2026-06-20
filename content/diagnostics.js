@@ -24,6 +24,8 @@
     CREATE_BUTTON_NOT_FOUND: "CREATE_BUTTON_NOT_FOUND",
     CREATE_BUTTON_DISABLED_TIMEOUT: "CREATE_BUTTON_DISABLED_TIMEOUT",
     CREATE_CLICK_FAILED: "CREATE_CLICK_FAILED",
+    CREATE_TRUSTED_CLICK_FAILED: "CREATE_TRUSTED_CLICK_FAILED",
+    CREATE_CLICK_NO_EFFECT: "CREATE_CLICK_NO_EFFECT",
     GENERATION_TIMEOUT: "GENERATION_TIMEOUT",
     NO_NEW_GENERATED_IMAGES: "NO_NEW_GENERATED_IMAGES",
     IMAGE_INDEX_OUT_OF_RANGE: "IMAGE_INDEX_OUT_OF_RANGE",
@@ -110,16 +112,25 @@
     }
 
     const rect = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+    const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(el) : null;
+
     return {
       tag: el.tagName,
       role: el.getAttribute ? el.getAttribute("role") : null,
       ariaLabel: el.getAttribute ? el.getAttribute("aria-label") : null,
+      ariaDisabled: el.getAttribute ? el.getAttribute("aria-disabled") : null,
+      disabled: el.getAttribute ? el.getAttribute("disabled") : null,
+      type: el.getAttribute ? el.getAttribute("type") : null,
       text: limitText((el.innerText || el.textContent || "").replace(/\s+/g, " ").trim(), 240),
+      pointerEvents: style ? style.pointerEvents : null,
+      cursor: style ? style.cursor : null,
       rect: rect ? {
         x: Math.round(rect.x),
         y: Math.round(rect.y),
         width: Math.round(rect.width),
-        height: Math.round(rect.height)
+        height: Math.round(rect.height),
+        centerX: Math.round(rect.left + rect.width / 2),
+        centerY: Math.round(rect.top + rect.height / 2)
       } : null
     };
   }

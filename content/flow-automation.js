@@ -221,30 +221,210 @@
     }
   }
 
-  async function clickCreate(ctx, createButton) {
-    await ctx.emitProgress(Diagnostics.STEPS.CLICK_CREATE, "running", "Haciendo click en Create...");
-    const beforeMediaIds = FlowSelectors.getCurrentGeneratedMediaIds();
+  function getElementClickPoint(el) {
+    const rect = el.getBoundingClientRect();
+    return {
+      x: Math.round(rect.left + rect.width / 2),
+      y: Math.round(rect.top + rect.height / 2),
+      rect: {
+        x: Math.round(rect.x),
+        y: Math.round(rect.y),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        centerX: Math.round(rect.left + rect.width / 2),
+        centerY: Math.round(rect.top + rect.height / 2)
+      }
+    };
+  }
 
-    try {
-      await DomUtils.clickElement(createButton);
-    } catch (error) {
-      await ctx.throwStructuredError(
-        Diagnostics.ERROR_CODES.CREATE_CLICK_FAILED,
-        Diagnostics.STEPS.CLICK_CREATE,
-        "No pude hacer click en Create.",
-        {
-          createButton: Diagnostics.describeElement(createButton),
-          beforeMediaIds
-        }
-      );
-    }
+  function findStopButton() {
+    return DomUtils.findVisibleByText("button,[role='button']", /(?:stop\s*)?Stop/i)[0] || null;
+  }
 
-    await ctx.emitProgress(Diagnostics.STEPS.CLICK_CREATE, "success", "Create clickeado.", {
-      beforeMediaIds,
-      createButton: Diagnostics.describeElement(createButton)
+  function getPromptEditorText() {
+    const editor = FlowSelectors.findPromptEditor();
+    return normalizePromptComparison(editor ? (editor.innerText || editor.textContent || "") : "");
+  }
+
+  function collectCreateEffectSignals(prompt, beforeMediaIds) {
+    const createButton = FlowSelectors.findCreateButton();
+    const stopButton = findStopButton();
+    const editorText = getPromptEditorText();
+    const bodyText = normalizePromptComparison(document.body.innerText || "");
+    const currentMediaIds = FlowSelectors.getCurrentGeneratedMediaIds();
+    const beforeSet = new Set(beforeMediaIds || []);
+    const newMediaIds = currentMediaIds.filter(function (mediaId) {
+      return !beforeSet.has(mediaId);
     });
 
-    return beforeMediaIds;
+    const promptStillInEditor = prompt ? editorText.indexOf(normalizePromptComparison(prompt)) !== -1 : false;
+    const editorLooksCleared = !promptStillInEditor && (
+      !editorText ||
+      /what do you want to create\?/i.test(editorText)
+    );
+
+    const signals = {
+      stopButtonFound: Boolean(stopButton),
+      createButtonFound: Boolean(createButton),
+      createButton: Diagnostics.describeElement(createButton),
+      stopButton: Diagnostics.describeElement(stopButton),
+      editorText,
+      promptStillInEditor,
+      editorLooksCleared,
+      currentMediaIds,
+      newMediaIds,
+      bodyHasStop: /\bstop\b/i.test(bodyText),
+      bodyHasGeneratingSignal: /(?:stop|generating|creating|thinking|cancel)/i.test(bodyText)
+    };
+
+    signals.started = Boolean(
+      signals.stopButtonFound ||
+      signals.editorLooksCleared ||
+      signals.newMediaIds.length ||
+      (!signals.createButtonFound && signals.bodyHasGeneratingSignal)
+    );
+
+    return signals;
+  }
+
+  async function waitForCreateEffect(prompt, beforeMediaIds, timeoutMs) {
+    const startedAt = Date.now();
+    let lastSignals = null;
+
+    while (Date.now() - startedAt < (timeoutMs || 5000)) {
+      lastSignals = collectCreateEffectSignals(prompt, beforeMediaIds);
+
+      if (lastSignals.started) {
+        lastSignals.durationMs = Date.now() - startedAt;
+        return lastSignals;
+      }
+
+      await DomUtils.sleep(250);
+    }
+
+    lastSignals = collectCreateEffectSignals(prompt, beforeMediaIds);
+    lastSignals.durationMs = Date.now() - startedAt;
+    return lastSignals;
+  }
+
+  async function requestDebuggerClick(createButton) {
+    DomUtils.scrollIntoViewCentered(createButton);
+    await DomUtils.sleep(150);
+
+    const point = getElementClickPoint(createButton);
+    const elementAtPoint = document.elementFromPoint(point.x, point.y);
+    const response = await chrome.runtime.sendMessage({
+      type: "FLOW_DEBUGGER_CLICK",
+      payload: {
+        x: point.x,
+        y: point.y,
+        delayMs: 90,
+        targetElement: Diagnostics.describeElement(createButton),
+        elementAtPoint: Diagnostics.describeElement(elementAtPoint)
+      }
+    });
+
+    return {
+      response,
+      point,
+      elementAtPoint: Diagnostics.describeElement(elementAtPoint),
+      elementAtPointIsCreateButton: Boolean(elementAtPoint && (elementAtPoint === createButton || createButton.contains(elementAtPoint)))
+    };
+  }
+
+  async function clickCreate(ctx, createButton, prompt) {
+    await ctx.emitProgress(Diagnostics.STEPS.CLICK_CREATE, "running", "Haciendo click real en Create...");
+    const beforeMediaIds = FlowSelectors.getCurrentGeneratedMediaIds();
+    const attempts = [];
+    const beforeState = {
+      beforeMediaIds,
+      createButton: Diagnostics.describeElement(createButton),
+      editorText: getPromptEditorText()
+    };
+
+    let lastSignals = null;
+
+    try {
+      const debuggerAttempt = await requestDebuggerClick(createButton);
+      attempts.push({
+        method: "chrome.debugger/Input.dispatchMouseEvent",
+        ok: Boolean(debuggerAttempt.response && debuggerAttempt.response.ok),
+        response: debuggerAttempt.response,
+        point: debuggerAttempt.point,
+        elementAtPoint: debuggerAttempt.elementAtPoint,
+        elementAtPointIsCreateButton: debuggerAttempt.elementAtPointIsCreateButton
+      });
+
+      lastSignals = await waitForCreateEffect(prompt, beforeMediaIds, 5000);
+
+      if (lastSignals.started) {
+        await ctx.emitProgress(Diagnostics.STEPS.CLICK_CREATE, "success", "Create activado con click real.", {
+          beforeState,
+          attempts,
+          effectSignals: lastSignals
+        });
+
+        return beforeMediaIds;
+      }
+    } catch (error) {
+      attempts.push({
+        method: "chrome.debugger/Input.dispatchMouseEvent",
+        ok: false,
+        error: {
+          message: error && error.message ? error.message : String(error),
+          code: error && error.code ? error.code : null,
+          details: error && error.details ? error.details : {}
+        }
+      });
+    }
+
+    // Diagnostic fallback only. The probe confirmed that Google Flow ignores this
+    // path in the current UI, but keeping it helps identify permission or debugger
+    // failures separately from DOM selector issues.
+    try {
+      const fallbackButton = FlowSelectors.findCreateButton() || createButton;
+      await DomUtils.clickElement(fallbackButton);
+      attempts.push({
+        method: "dom-dispatchEvent-and-element-click",
+        ok: true,
+        createButton: Diagnostics.describeElement(fallbackButton)
+      });
+
+      lastSignals = await waitForCreateEffect(prompt, beforeMediaIds, 3000);
+
+      if (lastSignals.started) {
+        await ctx.emitProgress(Diagnostics.STEPS.CLICK_CREATE, "success", "Create activado con fallback DOM.", {
+          beforeState,
+          attempts,
+          effectSignals: lastSignals
+        });
+
+        return beforeMediaIds;
+      }
+    } catch (error) {
+      attempts.push({
+        method: "dom-dispatchEvent-and-element-click",
+        ok: false,
+        error: {
+          message: error && error.message ? error.message : String(error),
+          code: error && error.code ? error.code : null,
+          details: error && error.details ? error.details : {}
+        }
+      });
+    }
+
+    await ctx.throwStructuredError(
+      Diagnostics.ERROR_CODES.CREATE_CLICK_NO_EFFECT,
+      Diagnostics.STEPS.CLICK_CREATE,
+      "El click sobre Create se ejecuto, pero Google Flow no inicio la generacion.",
+      {
+        cause: "No aparecio Stop, no se limpio el editor, no hubo nuevos mediaIds y no se detecto cambio de estado despues del click.",
+        beforeState,
+        attempts,
+        lastSignals: lastSignals || collectCreateEffectSignals(prompt, beforeMediaIds),
+        domSummary: buildDomSummary()
+      }
+    );
   }
 
   async function waitForNewGeneratedImages(ctx, beforeMediaIds, options) {
@@ -364,6 +544,7 @@
         completeFailure(code, message, {
           beforeMediaIds,
           currentMediaIds: FlowSelectors.getCurrentGeneratedMediaIds(),
+          createEffectSignals: collectCreateEffectSignals(null, beforeMediaIds),
           durationMs: Date.now() - startedAt
         });
       }, timeoutMs);
@@ -529,7 +710,7 @@
     await validatePage(ctx);
     await setPrompt(ctx, prompt);
     const createButton = await waitForCreateEnabled(ctx, config.options.createEnabledTimeoutMs);
-    const beforeMediaIds = await clickCreate(ctx, createButton);
+    const beforeMediaIds = await clickCreate(ctx, createButton, prompt);
     const newImages = await waitForNewGeneratedImages(ctx, beforeMediaIds, {
       timeoutMs: config.options.generationTimeoutMs,
       stableMs: 2000
