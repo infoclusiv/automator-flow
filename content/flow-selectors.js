@@ -318,6 +318,175 @@
     return nested ? nested.closest("[role='menuitem']") || nested : null;
   }
 
+
+  function escapeRegexText(value) {
+    return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function stripFileExtension(fileName) {
+    return String(fileName || "").replace(/\.[^.\\/]+$/, "");
+  }
+
+  function findAddMediaButton() {
+    const buttons = DomUtils.findVisibleByText("button,[role='button']", /Add Media/i);
+    if (!buttons.length) {
+      return null;
+    }
+
+    return buttons
+      .slice()
+      .sort(function (a, b) {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        let as = 0;
+        let bs = 0;
+        if (/^add\s*Add Media$/i.test(textOf(a)) || /Add Media/i.test(textOf(a))) as += 1000;
+        if (/^add\s*Add Media$/i.test(textOf(b)) || /Add Media/i.test(textOf(b))) bs += 1000;
+        if (isCenterPointInteractable(a)) as += 500;
+        if (isCenterPointInteractable(b)) bs += 500;
+        as += Math.round(ar.top / 20) + Math.round(ar.left / 20);
+        bs += Math.round(br.top / 20) + Math.round(br.left / 20);
+        return bs - as;
+      })[0] || null;
+  }
+
+  function findUploadMediaButton() {
+    const buttons = DomUtils.findVisibleByText("button,[role='button']", /Upload media/i);
+    if (!buttons.length) {
+      return null;
+    }
+
+    return buttons
+      .slice()
+      .sort(function (a, b) {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        let as = /^upload\s*Upload media$/i.test(textOf(a)) ? 1000 : 0;
+        let bs = /^upload\s*Upload media$/i.test(textOf(b)) ? 1000 : 0;
+        if (isCenterPointInteractable(a)) as += 500;
+        if (isCenterPointInteractable(b)) bs += 500;
+        as += Math.max(0, 2000 - Math.abs(ar.width - 120));
+        bs += Math.max(0, 2000 - Math.abs(br.width - 120));
+        return bs - as;
+      })[0] || null;
+  }
+
+  function findReferenceFileInputs() {
+    return Array.from(document.querySelectorAll('input[type="file"]')).filter(function (input) {
+      const accept = input.getAttribute("accept") || "";
+      return /image|video|heic|heif/i.test(accept);
+    });
+  }
+
+  function findIAgreeButton() {
+    return DomUtils.findVisibleByText("button,[role='button']", /^I agree$/i)[0] ||
+      DomUtils.findVisibleByText("button,[role='button']", /I agree/i)[0] ||
+      null;
+  }
+
+  function findAddToPromptButton() {
+    const buttons = DomUtils.findVisibleByText("button,[role='button']", /Add to Prompt/i);
+    if (!buttons.length) {
+      return null;
+    }
+
+    return buttons
+      .slice()
+      .sort(function (a, b) {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        let as = /^Add to Prompt$/i.test(textOf(a)) ? 1000 : 0;
+        let bs = /^Add to Prompt$/i.test(textOf(b)) ? 1000 : 0;
+        if (a.getAttribute("disabled") === null && a.getAttribute("aria-disabled") !== "true") as += 300;
+        if (b.getAttribute("disabled") === null && b.getAttribute("aria-disabled") !== "true") bs += 300;
+        if (isCenterPointInteractable(a)) as += 500;
+        if (isCenterPointInteractable(b)) bs += 500;
+        as += Math.round(ar.width / 10);
+        bs += Math.round(br.width / 10);
+        return bs - as;
+      })[0] || null;
+  }
+
+  function expandToAssetTile(el, needle) {
+    if (!el) {
+      return null;
+    }
+
+    const normalizedNeedle = String(needle || "").toLowerCase();
+    let current = el;
+    let best = el;
+
+    for (let depth = 0; current && depth < 7; depth += 1) {
+      const text = textOf(current).toLowerCase();
+      if (normalizedNeedle && text.indexOf(normalizedNeedle) === -1) {
+        break;
+      }
+
+      const rect = current.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      if (DomUtils.isVisible(current) && area >= 1200 && area <= 260000) {
+        best = current;
+      }
+
+      current = current.parentElement;
+    }
+
+    return best;
+  }
+
+  function findUploadedAssetByName(fileName) {
+    const rawName = String(fileName || "").trim();
+    if (!rawName) {
+      return null;
+    }
+
+    const needles = [rawName, stripFileExtension(rawName)]
+      .map(function (item) { return item.toLowerCase(); })
+      .filter(Boolean);
+
+    const candidates = Array.from(document.querySelectorAll("button,[role='button'],div,span,a,li"))
+      .filter(DomUtils.isVisible)
+      .map(function (el) {
+        const text = textOf(el);
+        const lower = text.toLowerCase();
+        const matchedNeedle = needles.find(function (needle) {
+          return needle && lower.indexOf(needle) !== -1;
+        });
+        if (!matchedNeedle) {
+          return null;
+        }
+
+        const tile = expandToAssetTile(el, matchedNeedle) || el;
+        const rect = tile.getBoundingClientRect();
+        const area = rect.width * rect.height;
+        let score = 0;
+        if (isInViewport(tile)) score += 500;
+        if (isCenterPointInteractable(tile)) score += 700;
+        if (/Image/i.test(textOf(tile))) score += 100;
+        score += Math.max(0, 200000 - Math.abs(area - 15000));
+        score -= Math.max(0, area - 300000);
+
+        return {
+          element: tile,
+          score,
+          text: textOf(tile)
+        };
+      })
+      .filter(Boolean);
+
+    if (!candidates.length) {
+      return null;
+    }
+
+    return candidates
+      .sort(function (a, b) { return b.score - a.score; })[0]
+      .element || null;
+  }
+
+  function isAddMediaPanelOpen() {
+    return Boolean(findUploadMediaButton() || findAddToPromptButton());
+  }
+
   scope.FlowSelectors = {
     SELECTORS,
     findPromptEditor,
@@ -332,6 +501,13 @@
     findImageDownloadMenu,
     findDownloadMenuItem,
     findOriginalSizeOption,
+    findAddMediaButton,
+    findUploadMediaButton,
+    findReferenceFileInputs,
+    findIAgreeButton,
+    findAddToPromptButton,
+    findUploadedAssetByName,
+    isAddMediaPanelOpen,
     isInViewport,
     isCenterPointInteractable,
     getCenterPoint

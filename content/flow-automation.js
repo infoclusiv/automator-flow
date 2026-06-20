@@ -1255,6 +1255,441 @@
     };
   }
 
+
+  function getFileNameFromPath(filePath) {
+    const cleaned = String(filePath || "").trim().replace(/^['\"]|['\"]$/g, "");
+    const parts = cleaned.split(/[\\/]/);
+    return parts[parts.length - 1] || cleaned;
+  }
+
+  function stripExtension(fileName) {
+    return String(fileName || "").replace(/\.[^.\\/]+$/, "");
+  }
+
+  function normalizeLocalReferencePath(value) {
+    const cleaned = String(value || "").trim().replace(/^['\"]|['\"]$/g, "");
+    if (!cleaned) {
+      return "";
+    }
+
+    return cleaned;
+  }
+
+  function looksLikeLocalFilePath(filePath) {
+    return /^[a-zA-Z]:[\\/]/.test(filePath) || /^\\\\/.test(filePath) || /^\//.test(filePath);
+  }
+
+  async function setDebuggerFileInputFiles(filePath, details) {
+    const response = await chrome.runtime.sendMessage({
+      type: "FLOW_DEBUGGER_SET_FILE_INPUT_FILES",
+      payload: {
+        files: [filePath],
+        selector: 'input[type="file"]',
+        acceptPattern: "image|video|heic|heif",
+        prepared: true,
+        skipBringToFront: true,
+        keepAttached: true,
+        detachAfterSet: false,
+        settleMs: details && details.settleMs ? details.settleMs : 650,
+        label: details && details.label ? details.label : "set-reference-file-input"
+      }
+    });
+
+    if (!response || !response.ok) {
+      const error = new Error(response && response.error && response.error.message ? response.error.message : "No pude asignar el archivo local al input file de Flow.");
+      error.code = response && response.error && response.error.code ? response.error.code : "FILE_INPUT_SET_FAILED";
+      error.details = response && response.error && response.error.details ? response.error.details : { response };
+      throw error;
+    }
+
+    return response;
+  }
+
+  async function openAddMediaPanel(ctx, debugAttempts) {
+    if (FlowSelectors.isAddMediaPanelOpen && FlowSelectors.isAddMediaPanelOpen()) {
+      return {
+        alreadyOpen: true,
+        uploadButton: Diagnostics.describeElement(FlowSelectors.findUploadMediaButton()),
+        addToPromptButton: Diagnostics.describeElement(FlowSelectors.findAddToPromptButton())
+      };
+    }
+
+    const addMediaTarget = await waitForFreshStableElementClickTarget(function () {
+      return FlowSelectors.findAddMediaButton ? FlowSelectors.findAddMediaButton() : null;
+    }, {
+      timeoutMs: 5000,
+      intervalMs: 90,
+      requiredStableSamples: 3,
+      label: "add-media-button"
+    });
+
+    if (!addMediaTarget || !addMediaTarget.ok) {
+      await ctx.throwStructuredError(
+        Diagnostics.ERROR_CODES.ADD_MEDIA_BUTTON_NOT_FOUND,
+        Diagnostics.STEPS.OPEN_ADD_MEDIA,
+        "No encontre el boton Add Media para abrir el panel de referencias.",
+        {
+          addMediaTarget,
+          domSummary: buildDomSummary()
+        }
+      );
+    }
+
+    const clickResult = await sendDebuggerClickToTarget(addMediaTarget, {
+      label: "click-add-media",
+      delayMs: 120,
+      detachAfterClick: false
+    });
+
+    debugAttempts.push({
+      step: "click-add-media",
+      ok: Boolean(clickResult.response && clickResult.response.ok),
+      result: clickResult
+    });
+
+    const panelWait = await waitForElement(function () {
+      return FlowSelectors.findUploadMediaButton && FlowSelectors.findUploadMediaButton();
+    }, {
+      timeoutMs: 8000,
+      intervalMs: 200
+    });
+
+    if (!panelWait.element) {
+      await ctx.throwStructuredError(
+        Diagnostics.ERROR_CODES.UPLOAD_MEDIA_BUTTON_NOT_FOUND,
+        Diagnostics.STEPS.OPEN_ADD_MEDIA,
+        "Abri Add Media, pero no encontre Upload media dentro del panel.",
+        {
+          addMediaTarget: summarizeElementTarget(addMediaTarget),
+          debugAttempts,
+          domSummary: buildDomSummary()
+        }
+      );
+    }
+
+    return {
+      alreadyOpen: false,
+      uploadButton: Diagnostics.describeElement(panelWait.element),
+      durationMs: panelWait.durationMs
+    };
+  }
+
+  async function acceptUploadTosIfNeeded(ctx, debugAttempts) {
+    const agreeWait = await waitForElement(function () {
+      return FlowSelectors.findIAgreeButton ? FlowSelectors.findIAgreeButton() : null;
+    }, {
+      timeoutMs: 8000,
+      intervalMs: 250
+    });
+
+    if (!agreeWait.element) {
+      return {
+        accepted: false,
+        reason: "tos-not-shown"
+      };
+    }
+
+    await ctx.emitProgress(Diagnostics.STEPS.ACCEPT_UPLOAD_TOS, "running", "Aceptando terminos de subida de imagen...");
+
+    const agreeTarget = await waitForFreshStableElementClickTarget(function () {
+      return FlowSelectors.findIAgreeButton ? FlowSelectors.findIAgreeButton() : null;
+    }, {
+      timeoutMs: 3500,
+      intervalMs: 90,
+      requiredStableSamples: 3,
+      label: "upload-tos-i-agree"
+    });
+
+    if (!agreeTarget || !agreeTarget.ok) {
+      await ctx.throwStructuredError(
+        Diagnostics.ERROR_CODES.UPLOAD_TOS_ACCEPT_FAILED,
+        Diagnostics.STEPS.ACCEPT_UPLOAD_TOS,
+        "Aparecio el aviso de terminos, pero no pude obtener coordenadas estables para I agree.",
+        {
+          agreeTarget,
+          debugAttempts,
+          domSummary: buildDomSummary()
+        }
+      );
+    }
+
+    const clickResult = await sendDebuggerClickToTarget(agreeTarget, {
+      label: "click-upload-tos-i-agree",
+      delayMs: 120,
+      detachAfterClick: false
+    });
+
+    debugAttempts.push({
+      step: "click-upload-tos-i-agree",
+      ok: Boolean(clickResult.response && clickResult.response.ok),
+      result: clickResult
+    });
+
+    await DomUtils.sleep(700);
+
+    await ctx.emitProgress(Diagnostics.STEPS.ACCEPT_UPLOAD_TOS, "success", "Terminos de subida aceptados.", {
+      agreeButton: summarizeElementTarget(agreeTarget)
+    });
+
+    return {
+      accepted: true,
+      clickResult
+    };
+  }
+
+  async function waitForUploadedReferenceAsset(fileName, timeoutMs) {
+    const startedAt = Date.now();
+    const fallbackName = stripExtension(fileName);
+    let lastAddToPromptButton = null;
+    let lastAsset = null;
+
+    while (Date.now() - startedAt < (timeoutMs || 65000)) {
+      lastAsset = FlowSelectors.findUploadedAssetByName ? (
+        FlowSelectors.findUploadedAssetByName(fileName) || FlowSelectors.findUploadedAssetByName(fallbackName)
+      ) : null;
+      lastAddToPromptButton = FlowSelectors.findAddToPromptButton ? FlowSelectors.findAddToPromptButton() : null;
+
+      if (lastAsset) {
+        return {
+          asset: lastAsset,
+          addToPromptButton: lastAddToPromptButton,
+          durationMs: Date.now() - startedAt,
+          foundBy: "file-name"
+        };
+      }
+
+      // If Flow auto-selects the newly uploaded asset, Add to Prompt can become available
+      // before the file name is easy to isolate in the DOM.
+      if (lastAddToPromptButton && lastAddToPromptButton.getAttribute("aria-disabled") !== "true" && lastAddToPromptButton.getAttribute("disabled") === null) {
+        return {
+          asset: null,
+          addToPromptButton: lastAddToPromptButton,
+          durationMs: Date.now() - startedAt,
+          foundBy: "add-to-prompt-available"
+        };
+      }
+
+      await DomUtils.sleep(500);
+    }
+
+    return {
+      asset: lastAsset,
+      addToPromptButton: lastAddToPromptButton,
+      durationMs: Date.now() - startedAt,
+      foundBy: null
+    };
+  }
+
+  async function attachLocalReferenceImageIfRequested(ctx, options) {
+    const referenceImagePath = normalizeLocalReferencePath(options && options.referenceImagePath);
+    if (!referenceImagePath) {
+      return null;
+    }
+
+    const fileName = getFileNameFromPath(referenceImagePath);
+    const debugAttempts = [];
+    let debuggerPrepared = false;
+
+    if (!looksLikeLocalFilePath(referenceImagePath)) {
+      await ctx.throwStructuredError(
+        Diagnostics.ERROR_CODES.REFERENCE_IMAGE_PATH_INVALID,
+        Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE,
+        "La ruta de imagen de referencia debe ser una ruta local absoluta.",
+        {
+          referenceImagePath,
+          expectedExamples: [
+            "C:\\\\Users\\\\carlo\\\\Pictures\\\\referencia.png",
+            "D:\\\\imagenes\\\\referencia.jpg"
+          ]
+        }
+      );
+    }
+
+    try {
+      await ctx.emitProgress(Diagnostics.STEPS.OPEN_ADD_MEDIA, "running", "Abriendo Add Media para adjuntar imagen de referencia...", {
+        fileName
+      });
+
+      const prepareResponse = await prepareDebuggerForReason("upload-local-reference-image", 250);
+      debuggerPrepared = true;
+      debugAttempts.push({
+        step: "prepare-debugger-reference-upload",
+        ok: Boolean(prepareResponse && prepareResponse.ok),
+        response: prepareResponse
+      });
+
+      const openResult = await openAddMediaPanel(ctx, debugAttempts);
+      debugAttempts.push({
+        step: "open-add-media-panel",
+        ok: true,
+        result: openResult
+      });
+
+      await ctx.emitProgress(Diagnostics.STEPS.OPEN_ADD_MEDIA, "success", "Panel Add Media abierto.", {
+        fileName,
+        openResult
+      });
+
+      await ctx.emitProgress(Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE, "running", "Subiendo imagen local de referencia con CDP...", {
+        fileName,
+        referenceImagePath
+      });
+
+      const setFileResponse = await setDebuggerFileInputFiles(referenceImagePath, {
+        label: "set-local-reference-image-file",
+        settleMs: 850
+      });
+      debugAttempts.push({
+        step: "set-file-input-files",
+        ok: Boolean(setFileResponse && setFileResponse.ok),
+        response: setFileResponse
+      });
+
+      const tosResult = await acceptUploadTosIfNeeded(ctx, debugAttempts);
+      debugAttempts.push({
+        step: "accept-upload-tos-if-needed",
+        ok: true,
+        result: tosResult
+      });
+
+      const uploadWait = await waitForUploadedReferenceAsset(fileName, options && options.referenceUploadTimeoutMs ? options.referenceUploadTimeoutMs : 70000);
+      debugAttempts.push({
+        step: "wait-uploaded-reference-asset",
+        ok: Boolean(uploadWait.asset || uploadWait.addToPromptButton),
+        foundBy: uploadWait.foundBy,
+        durationMs: uploadWait.durationMs,
+        asset: Diagnostics.describeElement(uploadWait.asset),
+        addToPromptButton: Diagnostics.describeElement(uploadWait.addToPromptButton)
+      });
+
+      if (!uploadWait.asset && !uploadWait.addToPromptButton) {
+        await ctx.throwStructuredError(
+          Diagnostics.ERROR_CODES.UPLOADED_REFERENCE_NOT_FOUND,
+          Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE,
+          "La imagen local fue enviada al input, pero no pude confirmar que aparecio en Uploads/Assets.",
+          {
+            fileName,
+            referenceImagePath,
+            debugAttempts,
+            domSummary: buildDomSummary()
+          }
+        );
+      }
+
+      if (uploadWait.asset) {
+        const assetTarget = await waitForFreshStableElementClickTarget(function () {
+          return FlowSelectors.findUploadedAssetByName(fileName) || FlowSelectors.findUploadedAssetByName(stripExtension(fileName));
+        }, {
+          timeoutMs: 6000,
+          intervalMs: 90,
+          requiredStableSamples: 3,
+          label: "uploaded-reference-asset"
+        });
+
+        if (assetTarget && assetTarget.ok) {
+          const assetClick = await sendDebuggerClickToTarget(assetTarget, {
+            label: "click-uploaded-reference-asset",
+            delayMs: 120,
+            detachAfterClick: false
+          });
+          debugAttempts.push({
+            step: "click-uploaded-reference-asset",
+            ok: Boolean(assetClick.response && assetClick.response.ok),
+            result: assetClick
+          });
+          await DomUtils.sleep(500);
+        }
+      }
+
+      await ctx.emitProgress(Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE, "success", "Imagen de referencia subida o seleccionada.", {
+        fileName,
+        foundBy: uploadWait.foundBy,
+        asset: Diagnostics.describeElement(uploadWait.asset),
+        debugAttempts: debugAttempts.slice(-6)
+      });
+
+      await ctx.emitProgress(Diagnostics.STEPS.ADD_REFERENCE_TO_PROMPT, "running", "Agregando imagen de referencia al prompt...");
+
+      const addToPromptTarget = await waitForFreshStableElementClickTarget(function () {
+        return FlowSelectors.findAddToPromptButton ? FlowSelectors.findAddToPromptButton() : null;
+      }, {
+        timeoutMs: 10000,
+        intervalMs: 90,
+        requiredStableSamples: 3,
+        label: "add-reference-to-prompt-button"
+      });
+
+      if (!addToPromptTarget || !addToPromptTarget.ok) {
+        await ctx.throwStructuredError(
+          Diagnostics.ERROR_CODES.ADD_TO_PROMPT_BUTTON_NOT_FOUND,
+          Diagnostics.STEPS.ADD_REFERENCE_TO_PROMPT,
+          "No encontre el boton Add to Prompt para adjuntar la imagen de referencia.",
+          {
+            fileName,
+            referenceImagePath,
+            addToPromptTarget,
+            debugAttempts,
+            domSummary: buildDomSummary()
+          }
+        );
+      }
+
+      const addClick = await sendDebuggerClickToTarget(addToPromptTarget, {
+        label: "click-add-reference-to-prompt",
+        delayMs: 140,
+        detachAfterClick: false
+      });
+      debugAttempts.push({
+        step: "click-add-reference-to-prompt",
+        ok: Boolean(addClick.response && addClick.response.ok),
+        result: addClick
+      });
+
+      await DomUtils.sleep(1200);
+
+      await releaseDebuggerAfterFailedMeasurement("reference-image-attached");
+      debuggerPrepared = false;
+
+      await ctx.emitProgress(Diagnostics.STEPS.ADD_REFERENCE_TO_PROMPT, "success", "Imagen de referencia agregada al prompt.", {
+        fileName,
+        referenceImagePath,
+        addToPromptTarget: summarizeElementTarget(addToPromptTarget),
+        debugAttempts: debugAttempts.slice(-8)
+      });
+
+      return {
+        fileName,
+        referenceImagePath,
+        uploaded: true,
+        addedToPrompt: true,
+        debugAttempts
+      };
+    } catch (error) {
+      if (debuggerPrepared) {
+        await releaseDebuggerAfterFailedMeasurement("reference-upload-flow-error");
+      }
+
+      if (error && error.step) {
+        throw error;
+      }
+
+      await ctx.throwStructuredError(
+        error && error.code ? error.code : Diagnostics.ERROR_CODES.ADD_TO_PROMPT_FAILED,
+        Diagnostics.STEPS.ADD_REFERENCE_TO_PROMPT,
+        "Fallo el flujo para subir o adjuntar la imagen local de referencia.",
+        {
+          fileName,
+          referenceImagePath,
+          message: error && error.message ? error.message : String(error),
+          code: error && error.code ? error.code : null,
+          details: error && error.details ? error.details : {},
+          debugAttempts,
+          domSummary: buildDomSummary()
+        }
+      );
+    }
+  }
+
   async function revealImageActions(ctx, target) {
     const imageElement = target.element;
     const card = FlowSelectors.findImageCardForImage(imageElement) || imageElement;
@@ -1630,6 +2065,7 @@
     }
 
     await validatePage(ctx);
+    const referenceImage = await attachLocalReferenceImageIfRequested(ctx, config.options || {});
     await setPrompt(ctx, prompt);
     const createButton = await waitForCreateEnabled(ctx, config.options.createEnabledTimeoutMs);
     const beforeMediaIds = await clickCreate(ctx, createButton, prompt);
@@ -1647,6 +2083,7 @@
       selectedImageIndex: config.options.imageIndex || 0,
       selectedMediaId: selectedImage.mediaId,
       downloadAction: "clicked_1k_original_size",
+      referenceImage: referenceImage || null,
       downloadConfirmed: Boolean(selectedImage.downloadConfirmed),
       matchingDownloads: selectedImage.matchingDownloads || [],
       durationMs: new Date(diagnostics.endedAt).getTime() - new Date(diagnostics.startedAt).getTime(),

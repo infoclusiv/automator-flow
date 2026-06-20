@@ -10,7 +10,10 @@
     getLastDiagnostics: "FLOW_GET_LAST_DIAGNOSTICS"
   };
 
+  const POPUP_SETTINGS_KEY = "flowExtensionPopupSettings";
+
   const promptInput = document.getElementById("promptInput");
+  const referenceImagePathInput = document.getElementById("referenceImagePathInput");
   const runButton = document.getElementById("runButton");
   const copyDiagnosticsButton = document.getElementById("copyDiagnosticsButton");
   const flowBadge = document.getElementById("flowBadge");
@@ -83,9 +86,34 @@
     return tabs[0] || null;
   }
 
+  async function loadPopupSettings() {
+    try {
+      const data = await chrome.storage.local.get([POPUP_SETTINGS_KEY]);
+      const settings = data[POPUP_SETTINGS_KEY] || {};
+      if (settings.referenceImagePath) {
+        referenceImagePathInput.value = settings.referenceImagePath;
+      }
+    } catch (error) {
+      // Non-critical.
+    }
+  }
+
+  async function savePopupSettings() {
+    try {
+      await chrome.storage.local.set({
+        [POPUP_SETTINGS_KEY]: {
+          referenceImagePath: referenceImagePathInput.value.trim()
+        }
+      });
+    } catch (error) {
+      // Non-critical.
+    }
+  }
+
   async function initializePopupState() {
     renderLogs();
     copyDiagnosticsButton.disabled = true;
+    await loadPopupSettings();
     setStatus("Buscando una pestana activa de Google Flow...");
 
     const tab = await getActiveTab();
@@ -155,11 +183,30 @@
     }
   }
 
+  function normalizeReferencePath(path) {
+    return String(path || "").trim().replace(/^['\"]|['\"]$/g, "");
+  }
+
+  function isProbablyAbsoluteLocalPath(path) {
+    if (!path) {
+      return true;
+    }
+    return /^[a-zA-Z]:[\\/]/.test(path) || /^\\\\/.test(path) || /^\//.test(path);
+  }
+
   async function runFlowAutomation() {
     const prompt = promptInput.value.trim();
+    const referenceImagePath = normalizeReferencePath(referenceImagePathInput.value);
+
     if (!prompt) {
       setStatus("Escribe un prompt antes de lanzar la automatizacion.");
       appendLog("INIT", "error", "PROMPT_EMPTY");
+      return;
+    }
+
+    if (referenceImagePath && !isProbablyAbsoluteLocalPath(referenceImagePath)) {
+      setStatus("La ruta de imagen debe ser absoluta. Ejemplo: C:\\Users\\carlo\\Pictures\\referencia.png");
+      appendLog("UPLOAD_REFERENCE_IMAGE", "error", "REFERENCE_IMAGE_PATH_INVALID");
       return;
     }
 
@@ -169,13 +216,15 @@
       return;
     }
 
+    await savePopupSettings();
+
     activeRequestId = crypto.randomUUID();
     logs = [];
     renderLogs();
     setRequestBadge(activeRequestId.slice(0, 8));
     copyDiagnosticsButton.disabled = true;
     setStatus("Enviando solicitud al content script...");
-    appendLog("INIT", "running", "Solicitud creada.");
+    appendLog("INIT", "running", referenceImagePath ? "Solicitud creada con imagen de referencia." : "Solicitud creada.");
 
     const message = {
       type: MESSAGE_TYPES.run,
@@ -187,7 +236,9 @@
           downloadResolution: "1K",
           generationTimeoutMs: 120000,
           downloadTimeoutMs: 30000,
-          createEnabledTimeoutMs: 10000
+          createEnabledTimeoutMs: 10000,
+          referenceImagePath,
+          referenceUploadTimeoutMs: 70000
         }
       }
     };
@@ -261,6 +312,7 @@
 
   runButton.addEventListener("click", runFlowAutomation);
   copyDiagnosticsButton.addEventListener("click", copyDiagnostics);
+  referenceImagePathInput.addEventListener("change", savePopupSettings);
 
   initializePopupState();
 })();
