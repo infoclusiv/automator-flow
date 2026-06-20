@@ -350,6 +350,113 @@
       })[0] || null;
   }
 
+  function findPromptComposerAddButton() {
+    const editor = findPromptEditor();
+    if (!editor) {
+      return null;
+    }
+
+    const editorRect = editor.getBoundingClientRect();
+    const buttons = DomUtils.queryVisibleAll("button,[role='button']").filter(function (button) {
+      const text = textOf(button);
+      if (/arrow_forward\s*Create/i.test(text)) {
+        return false;
+      }
+      if (/Add Media/i.test(text)) {
+        return false;
+      }
+      if (/Upload media/i.test(text)) {
+        return false;
+      }
+      return /add_?2?|add/i.test(text);
+    });
+
+    const candidates = buttons.map(function (button) {
+      const rect = button.getBoundingClientRect();
+      const text = textOf(button);
+      const sameComposerRow = rect.top >= editorRect.top - 100 && rect.top <= editorRect.bottom + 110;
+      const closeToEditorLeft = rect.left >= editorRect.left - 40 && rect.left <= editorRect.left + 100;
+      const closeToEditorBottom = Math.abs((rect.top + rect.height / 2) - (editorRect.bottom + 33)) < 90;
+      let score = 0;
+
+      if (sameComposerRow) score += 1000;
+      if (closeToEditorLeft) score += 1000;
+      if (closeToEditorBottom) score += 500;
+      if (/add_?2/i.test(text)) score += 900;
+      if (/^add/i.test(text)) score += 250;
+      if (rect.width >= 24 && rect.width <= 52 && rect.height >= 24 && rect.height <= 52) score += 450;
+      if (isCenterPointInteractable(button)) score += 500;
+
+      // Penalize header/top-bar buttons. The correct reference button is near the prompt composer.
+      if (rect.top < Math.max(120, window.innerHeight * 0.35)) score -= 4000;
+      if (rect.left > editorRect.right + 30) score -= 1200;
+
+      return {
+        element: button,
+        score,
+        text,
+        rect
+      };
+    }).filter(function (item) {
+      return item.score > 0;
+    });
+
+    if (!candidates.length) {
+      return null;
+    }
+
+    return candidates.sort(function (a, b) {
+      return b.score - a.score;
+    })[0].element || null;
+  }
+
+  function findReferencePanelUploadMediaButton() {
+    const addToPrompt = findAddToPromptButton();
+    const buttons = DomUtils.findVisibleByText("button,[role='button']", /Upload media/i);
+    if (!buttons.length) {
+      return null;
+    }
+
+    const addRect = addToPrompt ? addToPrompt.getBoundingClientRect() : null;
+    const candidates = buttons.map(function (button) {
+      const rect = button.getBoundingClientRect();
+      const text = textOf(button);
+      let score = 0;
+
+      if (/^upload\s*Upload media$/i.test(text)) score += 1000;
+      if (isCenterPointInteractable(button)) score += 500;
+      if (button.getAttribute("role") !== "menuitem") score += 700;
+      if (rect.top > window.innerHeight * 0.45) score += 800;
+
+      if (addRect) {
+        const sameVerticalBand = Math.abs((rect.top + rect.height / 2) - (addRect.top + addRect.height / 2)) < 140;
+        const leftOfAddToPrompt = rect.right <= addRect.right + 80;
+        if (sameVerticalBand) score += 1200;
+        if (leftOfAddToPrompt) score += 400;
+      }
+
+      // The global menu upload item appears near the top and has role=menuitem.
+      if (rect.top < Math.max(180, window.innerHeight * 0.25)) score -= 4000;
+
+      return { element: button, score, text, rect };
+    }).filter(function (item) {
+      return item.score > 0;
+    });
+
+    if (!candidates.length) {
+      return null;
+    }
+
+    return candidates.sort(function (a, b) {
+      return b.score - a.score;
+    })[0].element || null;
+  }
+
+  function isReferencePromptPanelOpen() {
+    return Boolean(findAddToPromptButton());
+  }
+
+
   function findUploadMediaButton() {
     const buttons = DomUtils.findVisibleByText("button,[role='button']", /Upload media/i);
     if (!buttons.length) {
@@ -440,9 +547,14 @@
       return null;
     }
 
-    const needles = [rawName, stripFileExtension(rawName)]
+    const baseName = stripFileExtension(rawName);
+    const prefixNeedles = [24, 20, 16, 12].map(function (size) {
+      return baseName.length >= size ? baseName.slice(0, size) : "";
+    });
+    const needles = [rawName, baseName].concat(prefixNeedles)
       .map(function (item) { return item.toLowerCase(); })
-      .filter(Boolean);
+      .filter(Boolean)
+      .filter(function (item, index, arr) { return arr.indexOf(item) === index; });
 
     const candidates = Array.from(document.querySelectorAll("button,[role='button'],div,span,a,li"))
       .filter(DomUtils.isVisible)
@@ -502,6 +614,9 @@
     findDownloadMenuItem,
     findOriginalSizeOption,
     findAddMediaButton,
+    findPromptComposerAddButton,
+    findReferencePanelUploadMediaButton,
+    isReferencePromptPanelOpen,
     findUploadMediaButton,
     findReferenceFileInputs,
     findIAgreeButton,

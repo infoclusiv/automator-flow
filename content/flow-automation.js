@@ -1306,61 +1306,92 @@
   }
 
   async function openAddMediaPanel(ctx, debugAttempts) {
-    if (FlowSelectors.isAddMediaPanelOpen && FlowSelectors.isAddMediaPanelOpen()) {
+    // IMPORTANT: Google Flow has two upload entry points.
+    // 1) The global top-bar + menu uploads media to the project only.
+    // 2) The prompt composer + opens the reference panel that contains Add to Prompt.
+    // For reference images we must use #2 and validate Add to Prompt is visible.
+    if (FlowSelectors.isReferencePromptPanelOpen && FlowSelectors.isReferencePromptPanelOpen()) {
       return {
         alreadyOpen: true,
-        uploadButton: Diagnostics.describeElement(FlowSelectors.findUploadMediaButton()),
-        addToPromptButton: Diagnostics.describeElement(FlowSelectors.findAddToPromptButton())
+        mode: "prompt-composer-reference-panel",
+        composerAddButton: null,
+        uploadButton: Diagnostics.describeElement(FlowSelectors.findReferencePanelUploadMediaButton ? FlowSelectors.findReferencePanelUploadMediaButton() : null),
+        addToPromptButton: Diagnostics.describeElement(FlowSelectors.findAddToPromptButton ? FlowSelectors.findAddToPromptButton() : null)
       };
     }
 
-    const addMediaTarget = await waitForFreshStableElementClickTarget(function () {
-      return FlowSelectors.findAddMediaButton ? FlowSelectors.findAddMediaButton() : null;
+    const composerAddTarget = await waitForFreshStableElementClickTarget(function () {
+      return FlowSelectors.findPromptComposerAddButton ? FlowSelectors.findPromptComposerAddButton() : null;
     }, {
-      timeoutMs: 5000,
+      timeoutMs: 6000,
       intervalMs: 90,
       requiredStableSamples: 3,
-      label: "add-media-button"
+      label: "prompt-composer-add-reference-button"
     });
 
-    if (!addMediaTarget || !addMediaTarget.ok) {
+    if (!composerAddTarget || !composerAddTarget.ok) {
       await ctx.throwStructuredError(
-        Diagnostics.ERROR_CODES.ADD_MEDIA_BUTTON_NOT_FOUND,
+        Diagnostics.ERROR_CODES.PROMPT_COMPOSER_ADD_BUTTON_NOT_FOUND,
         Diagnostics.STEPS.OPEN_ADD_MEDIA,
-        "No encontre el boton Add Media para abrir el panel de referencias.",
+        "No encontre el boton + del compositor del prompt. No voy a usar el Add Media superior porque no adjunta al prompt.",
         {
-          addMediaTarget,
+          composerAddTarget,
+          addMediaTopButton: Diagnostics.describeElement(FlowSelectors.findAddMediaButton ? FlowSelectors.findAddMediaButton() : null),
+          promptEditor: Diagnostics.describeElement(FlowSelectors.findPromptEditor ? FlowSelectors.findPromptEditor() : null),
           domSummary: buildDomSummary()
         }
       );
     }
 
-    const clickResult = await sendDebuggerClickToTarget(addMediaTarget, {
-      label: "click-add-media",
+    const clickResult = await sendDebuggerClickToTarget(composerAddTarget, {
+      label: "click-prompt-composer-add-reference",
       delayMs: 120,
       detachAfterClick: false
     });
 
     debugAttempts.push({
-      step: "click-add-media",
+      step: "click-prompt-composer-add-reference",
       ok: Boolean(clickResult.response && clickResult.response.ok),
       result: clickResult
     });
 
     const panelWait = await waitForElement(function () {
-      return FlowSelectors.findUploadMediaButton && FlowSelectors.findUploadMediaButton();
+      return FlowSelectors.findAddToPromptButton ? FlowSelectors.findAddToPromptButton() : null;
     }, {
-      timeoutMs: 8000,
+      timeoutMs: 10000,
       intervalMs: 200
     });
 
     if (!panelWait.element) {
       await ctx.throwStructuredError(
-        Diagnostics.ERROR_CODES.UPLOAD_MEDIA_BUTTON_NOT_FOUND,
+        Diagnostics.ERROR_CODES.REFERENCE_PANEL_WITH_ADD_TO_PROMPT_NOT_FOUND,
         Diagnostics.STEPS.OPEN_ADD_MEDIA,
-        "Abri Add Media, pero no encontre Upload media dentro del panel.",
+        "Abri el + del compositor, pero no aparecio el panel con Add to Prompt. Esto evita usar el menu global equivocado.",
         {
-          addMediaTarget: summarizeElementTarget(addMediaTarget),
+          composerAddTarget: summarizeElementTarget(composerAddTarget),
+          topAddMediaButton: Diagnostics.describeElement(FlowSelectors.findAddMediaButton ? FlowSelectors.findAddMediaButton() : null),
+          uploadButtonGlobal: Diagnostics.describeElement(FlowSelectors.findUploadMediaButton ? FlowSelectors.findUploadMediaButton() : null),
+          debugAttempts,
+          domSummary: buildDomSummary()
+        }
+      );
+    }
+
+    const uploadWait = await waitForElement(function () {
+      return FlowSelectors.findReferencePanelUploadMediaButton ? FlowSelectors.findReferencePanelUploadMediaButton() : null;
+    }, {
+      timeoutMs: 6000,
+      intervalMs: 200
+    });
+
+    if (!uploadWait.element) {
+      await ctx.throwStructuredError(
+        Diagnostics.ERROR_CODES.REFERENCE_UPLOAD_MEDIA_BUTTON_NOT_FOUND,
+        Diagnostics.STEPS.OPEN_ADD_MEDIA,
+        "El panel correcto con Add to Prompt esta abierto, pero no encontre su boton Upload media.",
+        {
+          addToPromptButton: Diagnostics.describeElement(panelWait.element),
+          globalUploadButton: Diagnostics.describeElement(FlowSelectors.findUploadMediaButton ? FlowSelectors.findUploadMediaButton() : null),
           debugAttempts,
           domSummary: buildDomSummary()
         }
@@ -1369,8 +1400,56 @@
 
     return {
       alreadyOpen: false,
-      uploadButton: Diagnostics.describeElement(panelWait.element),
+      mode: "prompt-composer-reference-panel",
+      composerAddButton: summarizeElementTarget(composerAddTarget),
+      uploadButton: Diagnostics.describeElement(uploadWait.element),
+      addToPromptButton: Diagnostics.describeElement(panelWait.element),
       durationMs: panelWait.durationMs
+    };
+  }
+
+  async function clickReferencePanelUploadMedia(ctx, debugAttempts) {
+    const uploadTarget = await waitForFreshStableElementClickTarget(function () {
+      return FlowSelectors.findReferencePanelUploadMediaButton ? FlowSelectors.findReferencePanelUploadMediaButton() : null;
+    }, {
+      timeoutMs: 6000,
+      intervalMs: 90,
+      requiredStableSamples: 3,
+      label: "reference-panel-upload-media-button"
+    });
+
+    if (!uploadTarget || !uploadTarget.ok) {
+      await ctx.throwStructuredError(
+        Diagnostics.ERROR_CODES.REFERENCE_UPLOAD_MEDIA_BUTTON_NOT_FOUND,
+        Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE,
+        "No pude obtener coordenadas estables del Upload media dentro del panel de Add to Prompt.",
+        {
+          uploadTarget,
+          addToPromptButton: Diagnostics.describeElement(FlowSelectors.findAddToPromptButton ? FlowSelectors.findAddToPromptButton() : null),
+          globalUploadButton: Diagnostics.describeElement(FlowSelectors.findUploadMediaButton ? FlowSelectors.findUploadMediaButton() : null),
+          debugAttempts,
+          domSummary: buildDomSummary()
+        }
+      );
+    }
+
+    const clickResult = await sendDebuggerClickToTarget(uploadTarget, {
+      label: "click-reference-panel-upload-media",
+      delayMs: 120,
+      detachAfterClick: false
+    });
+
+    debugAttempts.push({
+      step: "click-reference-panel-upload-media",
+      ok: Boolean(clickResult.response && clickResult.response.ok),
+      result: clickResult
+    });
+
+    await DomUtils.sleep(550);
+
+    return {
+      target: uploadTarget,
+      clickResult
     };
   }
 
@@ -1458,16 +1537,9 @@
         };
       }
 
-      // If Flow auto-selects the newly uploaded asset, Add to Prompt can become available
-      // before the file name is easy to isolate in the DOM.
-      if (lastAddToPromptButton && lastAddToPromptButton.getAttribute("aria-disabled") !== "true" && lastAddToPromptButton.getAttribute("disabled") === null) {
-        return {
-          asset: null,
-          addToPromptButton: lastAddToPromptButton,
-          durationMs: Date.now() - startedAt,
-          foundBy: "add-to-prompt-available"
-        };
-      }
+      // Do not use Add to Prompt availability alone as proof of upload.
+      // The reference panel can expose Add to Prompt before the just-uploaded file is visible,
+      // which could attach an older selected asset. We wait for the uploaded file name/prefix.
 
       await DomUtils.sleep(500);
     }
@@ -1530,14 +1602,27 @@
         openResult
       });
 
-      await ctx.emitProgress(Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE, "running", "Subiendo imagen local de referencia con CDP...", {
+      await ctx.emitProgress(Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE, "running", "Haciendo click en Upload media del panel de referencia...", {
+        fileName,
+        referenceImagePath,
+        openMode: openResult && openResult.mode
+      });
+
+      const uploadClick = await clickReferencePanelUploadMedia(ctx, debugAttempts);
+      debugAttempts.push({
+        step: "reference-panel-upload-media-clicked",
+        ok: true,
+        uploadTarget: summarizeElementTarget(uploadClick.target)
+      });
+
+      await ctx.emitProgress(Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE, "running", "Subiendo imagen local de referencia con CDP en el input activado por el panel correcto...", {
         fileName,
         referenceImagePath
       });
 
       const setFileResponse = await setDebuggerFileInputFiles(referenceImagePath, {
-        label: "set-local-reference-image-file",
-        settleMs: 850
+        label: "set-local-reference-image-file-from-reference-panel",
+        settleMs: 1200
       });
       debugAttempts.push({
         step: "set-file-input-files",
@@ -1555,18 +1640,18 @@
       const uploadWait = await waitForUploadedReferenceAsset(fileName, options && options.referenceUploadTimeoutMs ? options.referenceUploadTimeoutMs : 70000);
       debugAttempts.push({
         step: "wait-uploaded-reference-asset",
-        ok: Boolean(uploadWait.asset || uploadWait.addToPromptButton),
+        ok: Boolean(uploadWait.asset),
         foundBy: uploadWait.foundBy,
         durationMs: uploadWait.durationMs,
         asset: Diagnostics.describeElement(uploadWait.asset),
         addToPromptButton: Diagnostics.describeElement(uploadWait.addToPromptButton)
       });
 
-      if (!uploadWait.asset && !uploadWait.addToPromptButton) {
+      if (!uploadWait.asset) {
         await ctx.throwStructuredError(
           Diagnostics.ERROR_CODES.UPLOADED_REFERENCE_NOT_FOUND,
           Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE,
-          "La imagen local fue enviada al input, pero no pude confirmar que aparecio en Uploads/Assets.",
+          "La imagen local fue enviada al input del panel correcto, pero no pude confirmar que aparecio en la lista de assets por nombre o prefijo.",
           {
             fileName,
             referenceImagePath,

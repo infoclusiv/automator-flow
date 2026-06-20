@@ -102,7 +102,7 @@
     try {
       await chrome.storage.local.set({
         [POPUP_SETTINGS_KEY]: {
-          referenceImagePath: referenceImagePathInput.value.trim()
+          referenceImagePath: normalizeReferencePath(referenceImagePathInput.value)
         }
       });
     } catch (error) {
@@ -216,6 +216,7 @@
       return;
     }
 
+    referenceImagePathInput.value = referenceImagePath;
     await savePopupSettings();
 
     activeRequestId = crypto.randomUUID();
