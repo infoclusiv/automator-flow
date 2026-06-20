@@ -1,6 +1,8 @@
 const SESSION_STORAGE_KEY = "flowExtensionSessionState";
 const DIAGNOSTICS_STORAGE_KEY = "flowExtensionLastDiagnostics";
 const DEBUGGER_PROTOCOL_VERSION = "1.3";
+const debuggerSessions = new Map();
+
 
 async function setStoredState(partial) {
   const current = await chrome.storage.local.get([SESSION_STORAGE_KEY, DIAGNOSTICS_STORAGE_KEY]);
@@ -101,6 +103,99 @@ function assertFiniteNumber(value, name) {
   return numberValue;
 }
 
+function getTabSession(tabId) {
+  return debuggerSessions.get(String(tabId)) || null;
+}
+
+function setTabSession(tabId, session) {
+  debuggerSessions.set(String(tabId), session);
+}
+
+function clearTabSession(tabId) {
+  debuggerSessions.delete(String(tabId));
+}
+
+async function prepareDebuggerForTab(tabId, payload) {
+  if (!tabId && tabId !== 0) {
+    throw makeError("DEBUGGER_TAB_NOT_FOUND", "No active tab id was available for debugger prepare.", {
+      tabId
+    });
+  }
+
+  if (!chrome.debugger || typeof chrome.debugger.attach !== "function") {
+    throw makeError("DEBUGGER_API_UNAVAILABLE", "chrome.debugger API is unavailable. Check manifest permissions.", {});
+  }
+
+  const target = { tabId };
+  const startedAt = Date.now();
+  const attachInfo = await attachDebugger(target);
+
+  try {
+    await sendDebuggerCommand(target, "Page.bringToFront", {});
+  } catch (bringToFrontError) {
+    console.warn("FLOW_DEBUGGER_BRING_TO_FRONT_WARNING", bringToFrontError && bringToFrontError.message ? bringToFrontError.message : bringToFrontError);
+  }
+
+  const settleMs = Math.max(0, Number(payload && payload.settleMs) || 200);
+  await new Promise(function (resolve) {
+    setTimeout(resolve, settleMs);
+  });
+
+  const session = {
+    tabId,
+    target,
+    attachInfo,
+    preparedAt: new Date().toISOString(),
+    reason: payload && payload.reason ? payload.reason : null
+  };
+  setTabSession(tabId, session);
+
+  return {
+    ok: true,
+    method: "chrome.debugger.prepare",
+    tabId,
+    attachInfo,
+    settleMs,
+    durationMs: Date.now() - startedAt
+  };
+}
+
+async function releaseDebuggerForTab(tabId, reason) {
+  const session = getTabSession(tabId);
+  const target = { tabId };
+
+  if (!session) {
+    return {
+      ok: true,
+      tabId,
+      released: false,
+      reason: reason || null,
+      message: "No prepared debugger session was registered."
+    };
+  }
+
+  clearTabSession(tabId);
+
+  if (session.attachInfo && session.attachInfo.attachedNow) {
+    const detached = await detachDebugger(target);
+    return {
+      ok: detached.ok,
+      tabId,
+      released: true,
+      reason: reason || null,
+      warning: detached.warning || null
+    };
+  }
+
+  return {
+    ok: true,
+    tabId,
+    released: false,
+    reason: reason || null,
+    message: "Debugger was already attached before this prepare call."
+  };
+}
+
 async function dispatchDebuggerMouseClick(tabId, payload) {
   if (!tabId && tabId !== 0) {
     throw makeError("DEBUGGER_TAB_NOT_FOUND", "No active tab id was available for debugger click.", {
@@ -117,11 +212,28 @@ async function dispatchDebuggerMouseClick(tabId, payload) {
   const delayMs = Math.max(0, Number(payload && payload.delayMs) || 80);
   const target = { tabId };
   const startedAt = Date.now();
-  let attachInfo = null;
+  const preparedSession = payload && payload.prepared ? getTabSession(tabId) : null;
+  let attachInfo = preparedSession ? preparedSession.attachInfo : null;
+  let attachedForThisClick = false;
   let detached = null;
 
   try {
-    attachInfo = await attachDebugger(target);
+    if (!preparedSession) {
+      attachInfo = await attachDebugger(target);
+      attachedForThisClick = Boolean(attachInfo && attachInfo.attachedNow);
+
+      if (!(payload && payload.skipBringToFront)) {
+        try {
+          await sendDebuggerCommand(target, "Page.bringToFront", {});
+        } catch (bringToFrontError) {
+          console.warn("FLOW_DEBUGGER_BRING_TO_FRONT_WARNING", bringToFrontError && bringToFrontError.message ? bringToFrontError.message : bringToFrontError);
+        }
+
+        await new Promise(function (resolve) {
+          setTimeout(resolve, 80);
+        });
+      }
+    }
 
     await sendDebuggerCommand(target, "Input.dispatchMouseEvent", {
       type: "mouseMoved",
@@ -129,7 +241,12 @@ async function dispatchDebuggerMouseClick(tabId, payload) {
       y,
       button: "none",
       buttons: 0,
-      clickCount: 0
+      clickCount: 0,
+      pointerType: "mouse"
+    });
+
+    await new Promise(function (resolve) {
+      setTimeout(resolve, 35);
     });
 
     await sendDebuggerCommand(target, "Input.dispatchMouseEvent", {
@@ -138,7 +255,8 @@ async function dispatchDebuggerMouseClick(tabId, payload) {
       y,
       button: "left",
       buttons: 1,
-      clickCount: 1
+      clickCount: 1,
+      pointerType: "mouse"
     });
 
     await new Promise(function (resolve) {
@@ -151,7 +269,8 @@ async function dispatchDebuggerMouseClick(tabId, payload) {
       y,
       button: "left",
       buttons: 0,
-      clickCount: 1
+      clickCount: 1,
+      pointerType: "mouse"
     });
 
     return {
@@ -160,12 +279,22 @@ async function dispatchDebuggerMouseClick(tabId, payload) {
       tabId,
       x,
       y,
+      prepared: Boolean(preparedSession),
       attachInfo,
       durationMs: Date.now() - startedAt
     };
   } finally {
-    if (attachInfo && attachInfo.attachedNow) {
-      detached = await detachDebugger(target);
+    const detachAfterClick = !(payload && payload.detachAfterClick === false);
+
+    if (detachAfterClick) {
+      if (preparedSession) {
+        clearTabSession(tabId);
+        if (preparedSession.attachInfo && preparedSession.attachInfo.attachedNow) {
+          detached = await detachDebugger(target);
+        }
+      } else if (attachedForThisClick) {
+        detached = await detachDebugger(target);
+      }
     }
 
     if (detached && !detached.ok) {
@@ -187,6 +316,54 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
 
   if (message.type === "FLOW_GET_LAST_DIAGNOSTICS") {
     getStoredState().then(sendResponse);
+    return true;
+  }
+
+  if (message.type === "FLOW_DEBUGGER_PREPARE") {
+    const tabId = sender && sender.tab ? sender.tab.id : null;
+
+    prepareDebuggerForTab(tabId, message.payload || {})
+      .then(function (result) {
+        sendResponse({
+          ok: true,
+          payload: result
+        });
+      })
+      .catch(function (error) {
+        sendResponse({
+          ok: false,
+          error: {
+            code: error && error.code ? error.code : "DEBUGGER_PREPARE_FAILED",
+            message: error && error.message ? error.message : "Debugger prepare failed.",
+            details: error && error.details ? error.details : {}
+          }
+        });
+      });
+
+    return true;
+  }
+
+  if (message.type === "FLOW_DEBUGGER_RELEASE") {
+    const tabId = sender && sender.tab ? sender.tab.id : null;
+
+    releaseDebuggerForTab(tabId, message.payload && message.payload.reason ? message.payload.reason : null)
+      .then(function (result) {
+        sendResponse({
+          ok: true,
+          payload: result
+        });
+      })
+      .catch(function (error) {
+        sendResponse({
+          ok: false,
+          error: {
+            code: error && error.code ? error.code : "DEBUGGER_RELEASE_FAILED",
+            message: error && error.message ? error.message : "Debugger release failed.",
+            details: error && error.details ? error.details : {}
+          }
+        });
+      });
+
     return true;
   }
 

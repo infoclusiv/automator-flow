@@ -15,6 +15,46 @@
     }) || null;
   }
 
+  function isInViewport(el) {
+    if (!el || !(el instanceof Element)) {
+      return false;
+    }
+
+    const rect = el.getBoundingClientRect();
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+
+    return rect.right > 0 &&
+      rect.bottom > 0 &&
+      rect.left < viewportWidth &&
+      rect.top < viewportHeight;
+  }
+
+  function getCenterPoint(el) {
+    const rect = el.getBoundingClientRect();
+    return {
+      x: Math.round(rect.left + rect.width / 2),
+      y: Math.round(rect.top + rect.height / 2)
+    };
+  }
+
+  function isCenterPointInteractable(el) {
+    if (!el || !isInViewport(el)) {
+      return false;
+    }
+
+    const point = getCenterPoint(el);
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+
+    if (point.x < 0 || point.y < 0 || point.x >= viewportWidth || point.y >= viewportHeight) {
+      return false;
+    }
+
+    const elementAtPoint = document.elementFromPoint(point.x, point.y);
+    return Boolean(elementAtPoint && (elementAtPoint === el || el.contains(elementAtPoint)));
+  }
+
   function findCreateButtons() {
     return DomUtils.findVisibleByText(SELECTORS.button, /Create/i).filter(function (button) {
       const text = DomUtils.getVisibleText(button);
@@ -22,8 +62,40 @@
     });
   }
 
+  function scoreCreateButton(button) {
+    const rect = button.getBoundingClientRect();
+    let score = 0;
+
+    if (button.getAttribute("disabled") === null && button.getAttribute("aria-disabled") !== "true") {
+      score += 1000;
+    }
+
+    if (isInViewport(button)) {
+      score += 500;
+    }
+
+    if (isCenterPointInteractable(button)) {
+      score += 1000;
+    }
+
+    // The prompt submit button normally sits near the bottom/right of the prompt editor area.
+    score += Math.max(0, Math.round(rect.left / 10));
+    score += Math.max(0, Math.round(rect.top / 20));
+
+    return score;
+  }
+
   function findCreateButton() {
-    return findCreateButtons()[0] || null;
+    const buttons = findCreateButtons();
+    if (!buttons.length) {
+      return null;
+    }
+
+    return buttons
+      .slice()
+      .sort(function (a, b) {
+        return scoreCreateButton(b) - scoreCreateButton(a);
+      })[0] || null;
   }
 
   function findGeneratedImages() {
@@ -125,6 +197,9 @@
     findImageCardForImage,
     findMoreButtonForImageCard,
     findDownloadMenuItem,
-    findOriginalSizeOption
+    findOriginalSizeOption,
+    isInViewport,
+    isCenterPointInteractable,
+    getCenterPoint
   };
 })();

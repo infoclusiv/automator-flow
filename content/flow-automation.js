@@ -221,20 +221,336 @@
     }
   }
 
-  function getElementClickPoint(el) {
+  function getViewportInfo() {
+    const visualViewport = window.visualViewport ? {
+      width: Math.round(window.visualViewport.width),
+      height: Math.round(window.visualViewport.height),
+      offsetLeft: Math.round(window.visualViewport.offsetLeft || 0),
+      offsetTop: Math.round(window.visualViewport.offsetTop || 0),
+      scale: window.visualViewport.scale || 1
+    } : null;
+
+    return {
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      clientWidth: document.documentElement.clientWidth,
+      clientHeight: document.documentElement.clientHeight,
+      devicePixelRatio: window.devicePixelRatio,
+      scrollX: Math.round(window.scrollX || 0),
+      scrollY: Math.round(window.scrollY || 0),
+      visualViewport
+    };
+  }
+
+  function getElementRect(el) {
     const rect = el.getBoundingClientRect();
     return {
-      x: Math.round(rect.left + rect.width / 2),
-      y: Math.round(rect.top + rect.height / 2),
-      rect: {
-        x: Math.round(rect.x),
-        y: Math.round(rect.y),
-        width: Math.round(rect.width),
-        height: Math.round(rect.height),
-        centerX: Math.round(rect.left + rect.width / 2),
-        centerY: Math.round(rect.top + rect.height / 2)
-      }
+      x: Math.round(rect.x),
+      y: Math.round(rect.y),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      top: Math.round(rect.top),
+      right: Math.round(rect.right),
+      bottom: Math.round(rect.bottom),
+      left: Math.round(rect.left),
+      centerX: Math.round(rect.left + rect.width / 2),
+      centerY: Math.round(rect.top + rect.height / 2)
     };
+  }
+
+  function isPointInViewport(x, y) {
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+    return x >= 0 && y >= 0 && x < viewportWidth && y < viewportHeight;
+  }
+
+  function buildCandidatePoints(el) {
+    const rect = el.getBoundingClientRect();
+    const specs = [
+      [0.5, 0.5],
+      [0.5, 0.4],
+      [0.5, 0.6],
+      [0.35, 0.5],
+      [0.65, 0.5],
+      [0.25, 0.5],
+      [0.75, 0.5]
+    ];
+
+    return specs.map(function (spec) {
+      return {
+        x: Math.round(rect.left + rect.width * spec[0]),
+        y: Math.round(rect.top + rect.height * spec[1]),
+        ratioX: spec[0],
+        ratioY: spec[1]
+      };
+    });
+  }
+
+  function describePointHit(button, point) {
+    if (!point || !isPointInViewport(point.x, point.y)) {
+      return {
+        point,
+        pointInViewport: false,
+        elementAtPoint: null,
+        elementAtPointIsCreateButton: false
+      };
+    }
+
+    const elementAtPoint = document.elementFromPoint(point.x, point.y);
+    return {
+      point,
+      pointInViewport: true,
+      elementAtPoint: Diagnostics.describeElement(elementAtPoint),
+      elementAtPointIsCreateButton: Boolean(elementAtPoint && (elementAtPoint === button || button.contains(elementAtPoint)))
+    };
+  }
+
+  function getBestCreateClickTarget(preferredButton) {
+    const candidates = [];
+    const seen = new Set();
+
+    function addCandidate(button) {
+      if (!button || seen.has(button)) {
+        return;
+      }
+      seen.add(button);
+      candidates.push(button);
+    }
+
+    addCandidate(preferredButton);
+    FlowSelectors.findCreateButtons().forEach(addCandidate);
+
+    const inspected = candidates.map(function (button) {
+      const rect = getElementRect(button);
+      const points = buildCandidatePoints(button).map(function (point) {
+        return describePointHit(button, point);
+      });
+      const hit = points.find(function (item) {
+        return item.elementAtPointIsCreateButton;
+      }) || null;
+
+      return {
+        button,
+        buttonDescription: Diagnostics.describeElement(button),
+        rect,
+        points,
+        hit,
+        inViewport: FlowSelectors.isInViewport ? FlowSelectors.isInViewport(button) : true
+      };
+    });
+
+    const usable = inspected.find(function (item) {
+      return item.hit && item.hit.elementAtPointIsCreateButton;
+    });
+
+    if (usable) {
+      return {
+        ok: true,
+        button: usable.button,
+        point: usable.hit.point,
+        rect: usable.rect,
+        elementAtPoint: usable.hit.elementAtPoint,
+        elementAtPointIsCreateButton: true,
+        inspected: inspected.map(function (item) {
+          return {
+            button: item.buttonDescription,
+            rect: item.rect,
+            inViewport: item.inViewport,
+            usablePoint: item.hit ? item.hit.point : null,
+            elementAtUsablePoint: item.hit ? item.hit.elementAtPoint : null,
+            points: item.points
+          };
+        })
+      };
+    }
+
+    return {
+      ok: false,
+      button: candidates[0] || null,
+      point: inspected[0] && inspected[0].points[0] ? inspected[0].points[0].point : null,
+      rect: inspected[0] ? inspected[0].rect : null,
+      elementAtPoint: inspected[0] && inspected[0].points[0] ? inspected[0].points[0].elementAtPoint : null,
+      elementAtPointIsCreateButton: false,
+      inspected: inspected.map(function (item) {
+        return {
+          button: item.buttonDescription,
+          rect: item.rect,
+          inViewport: item.inViewport,
+          usablePoint: item.hit ? item.hit.point : null,
+          elementAtUsablePoint: item.hit ? item.hit.elementAtPoint : null,
+          points: item.points
+        };
+      })
+    };
+  }
+
+  function makeTargetKey(target) {
+    if (!target || !target.point || !target.rect) {
+      return "missing";
+    }
+
+    return [
+      target.point.x,
+      target.point.y,
+      target.rect.x,
+      target.rect.y,
+      target.rect.width,
+      target.rect.height,
+      window.innerWidth || document.documentElement.clientWidth || 0,
+      window.innerHeight || document.documentElement.clientHeight || 0
+    ].join(":");
+  }
+
+  function summarizeFreshSample(target) {
+    if (!target) {
+      return null;
+    }
+
+    return {
+      ok: Boolean(target.ok),
+      point: target.point || null,
+      rect: target.rect || null,
+      elementAtPoint: target.elementAtPoint || null,
+      elementAtPointIsCreateButton: Boolean(target.elementAtPointIsCreateButton),
+      viewport: getViewportInfo(),
+      inspected: target.inspected || []
+    };
+  }
+
+  function waitForAnimationFrame() {
+    return new Promise(function (resolve) {
+      requestAnimationFrame(function () {
+        resolve();
+      });
+    });
+  }
+
+  async function waitForLayoutFrames(frameCount) {
+    const count = Math.max(1, Number(frameCount) || 1);
+    for (let index = 0; index < count; index += 1) {
+      await waitForAnimationFrame();
+    }
+  }
+
+  async function waitForFreshStableCreateClickTarget(options) {
+    const startedAt = Date.now();
+    const timeoutMs = options && options.timeoutMs ? options.timeoutMs : 4000;
+    const intervalMs = options && options.intervalMs ? options.intervalMs : 90;
+    const requiredStableSamples = options && options.requiredStableSamples ? options.requiredStableSamples : 4;
+    const samples = [];
+    let lastKey = null;
+    let stableCount = 0;
+    let lastTarget = null;
+
+    // Let Flow finish any immediate reflow caused by prompt insertion, focus,
+    // debugger attach, browser resizing, or floating prompt bar movement.
+    await waitForLayoutFrames(2);
+
+    while (Date.now() - startedAt < timeoutMs) {
+      // Critical rule: always locate the button again immediately before taking
+      // a coordinate sample. Never trust a button reference or rectangle captured
+      // before a scroll, resize, focus change, debugger attach, or layout shift.
+      const freshButton = FlowSelectors.findCreateButton();
+      const target = getBestCreateClickTarget(freshButton);
+      lastTarget = target;
+
+      const sample = {
+        time: new Date().toISOString(),
+        elapsedMs: Date.now() - startedAt,
+        key: target && target.ok ? makeTargetKey(target) : "not-hittable",
+        target: summarizeFreshSample(target)
+      };
+      samples.push(sample);
+
+      if (target && target.ok) {
+        if (sample.key === lastKey) {
+          stableCount += 1;
+        } else {
+          lastKey = sample.key;
+          stableCount = 1;
+        }
+
+        if (stableCount >= requiredStableSamples) {
+          // One final fresh re-read after stability is reached. This is the
+          // actual coordinate that will be sent to chrome.debugger.
+          await waitForLayoutFrames(1);
+          const finalButton = FlowSelectors.findCreateButton();
+          const finalTarget = getBestCreateClickTarget(finalButton);
+          const finalKey = finalTarget && finalTarget.ok ? makeTargetKey(finalTarget) : "not-hittable";
+
+          if (finalTarget && finalTarget.ok && finalKey === sample.key) {
+            finalTarget.freshCoordinatePolicy = "requery-button-before-each-sample-and-final-reread-before-click";
+            finalTarget.stableSamples = stableCount;
+            finalTarget.requiredStableSamples = requiredStableSamples;
+            finalTarget.durationMs = Date.now() - startedAt;
+            finalTarget.samples = samples.slice(-12);
+            finalTarget.finalKey = finalKey;
+            finalTarget.viewport = getViewportInfo();
+            return finalTarget;
+          }
+
+          samples.push({
+            time: new Date().toISOString(),
+            elapsedMs: Date.now() - startedAt,
+            key: finalKey,
+            rejectedFinalReread: true,
+            target: summarizeFreshSample(finalTarget)
+          });
+
+          lastKey = finalKey;
+          stableCount = finalTarget && finalTarget.ok ? 1 : 0;
+        }
+      } else {
+        stableCount = 0;
+        lastKey = null;
+      }
+
+      await DomUtils.sleep(intervalMs);
+    }
+
+    if (lastTarget) {
+      lastTarget.freshCoordinatePolicy = "failed-to-find-stable-fresh-coordinate";
+      lastTarget.stableSamples = stableCount;
+      lastTarget.requiredStableSamples = requiredStableSamples;
+      lastTarget.durationMs = Date.now() - startedAt;
+      lastTarget.samples = samples.slice(-20);
+      lastTarget.viewport = getViewportInfo();
+    }
+
+    return lastTarget;
+  }
+
+  async function prepareDebuggerForFreshCoordinates() {
+    const response = await chrome.runtime.sendMessage({
+      type: "FLOW_DEBUGGER_PREPARE",
+      payload: {
+        settleMs: 250,
+        reason: "prepare-before-fresh-create-coordinate-measurement",
+        viewport: getViewportInfo()
+      }
+    });
+
+    if (!response || !response.ok) {
+      const error = new Error(response && response.error && response.error.message ? response.error.message : "Debugger prepare failed.");
+      error.code = response && response.error && response.error.code ? response.error.code : "DEBUGGER_PREPARE_FAILED";
+      error.details = response && response.error && response.error.details ? response.error.details : { response };
+      throw error;
+    }
+
+    return response;
+  }
+
+  async function releaseDebuggerAfterFailedMeasurement(reason) {
+    try {
+      await chrome.runtime.sendMessage({
+        type: "FLOW_DEBUGGER_RELEASE",
+        payload: {
+          reason: reason || "release-after-failed-fresh-coordinate-measurement"
+        }
+      });
+    } catch (error) {
+      // Best effort only. The real failure is reported by the caller.
+    }
   }
 
   function findStopButton() {
@@ -307,28 +623,76 @@
     return lastSignals;
   }
 
-  async function requestDebuggerClick(createButton) {
-    DomUtils.scrollIntoViewCentered(createButton);
-    await DomUtils.sleep(150);
+  async function requestDebuggerClick() {
+    const prepareResponse = await prepareDebuggerForFreshCoordinates();
 
-    const point = getElementClickPoint(createButton);
-    const elementAtPoint = document.elementFromPoint(point.x, point.y);
+    // Recompute fresh coordinates only AFTER debugger attach / bringToFront.
+    // This avoids stale coordinates when Chrome or Flow shifts the viewport.
+    const target = await waitForFreshStableCreateClickTarget({
+      timeoutMs: 4500,
+      intervalMs: 90,
+      requiredStableSamples: 4
+    });
+
+    if (!target || !target.ok || !target.point) {
+      await releaseDebuggerAfterFailedMeasurement("stable-create-coordinate-not-found");
+      const error = new Error("No stable fresh viewport coordinate was found for the Create button.");
+      error.code = "CREATE_CLICK_TARGET_UNSTABLE";
+      error.details = {
+        prepareResponse,
+        target,
+        viewport: getViewportInfo()
+      };
+      throw error;
+    }
+
+    // Absolute final check immediately before sending the click.
+    const finalTarget = getBestCreateClickTarget(FlowSelectors.findCreateButton());
+    if (!finalTarget || !finalTarget.ok || makeTargetKey(finalTarget) !== makeTargetKey(target)) {
+      await releaseDebuggerAfterFailedMeasurement("fresh-coordinate-changed-before-click");
+      const error = new Error("Create button coordinates changed immediately before click.");
+      error.code = "CREATE_CLICK_TARGET_CHANGED_BEFORE_CLICK";
+      error.details = {
+        prepareResponse,
+        stableTarget: target,
+        finalTarget,
+        stableKey: makeTargetKey(target),
+        finalKey: makeTargetKey(finalTarget),
+        viewport: getViewportInfo()
+      };
+      throw error;
+    }
+
     const response = await chrome.runtime.sendMessage({
       type: "FLOW_DEBUGGER_CLICK",
       payload: {
-        x: point.x,
-        y: point.y,
-        delayMs: 90,
-        targetElement: Diagnostics.describeElement(createButton),
-        elementAtPoint: Diagnostics.describeElement(elementAtPoint)
+        x: finalTarget.point.x,
+        y: finalTarget.point.y,
+        delayMs: 120,
+        prepared: true,
+        skipBringToFront: true,
+        detachAfterClick: true,
+        targetElement: Diagnostics.describeElement(finalTarget.button),
+        elementAtPoint: finalTarget.elementAtPoint,
+        viewport: getViewportInfo(),
+        freshCoordinatePolicy: "prepared-debugger-then-requery-stable-final-coordinate"
       }
     });
 
+    await DomUtils.sleep(200);
+    const postClickTarget = getBestCreateClickTarget(FlowSelectors.findCreateButton());
+
     return {
       response,
-      point,
-      elementAtPoint: Diagnostics.describeElement(elementAtPoint),
-      elementAtPointIsCreateButton: Boolean(elementAtPoint && (elementAtPoint === createButton || createButton.contains(elementAtPoint)))
+      prepareResponse,
+      point: finalTarget.point,
+      target,
+      preClickTarget: finalTarget,
+      postClickTarget,
+      elementAtPoint: finalTarget.elementAtPoint,
+      elementAtPointIsCreateButton: finalTarget.elementAtPointIsCreateButton,
+      viewport: getViewportInfo(),
+      freshCoordinatePolicy: "prepared-debugger-then-requery-stable-final-coordinate"
     };
   }
 
@@ -345,14 +709,18 @@
     let lastSignals = null;
 
     try {
-      const debuggerAttempt = await requestDebuggerClick(createButton);
+      const debuggerAttempt = await requestDebuggerClick();
       attempts.push({
         method: "chrome.debugger/Input.dispatchMouseEvent",
         ok: Boolean(debuggerAttempt.response && debuggerAttempt.response.ok),
         response: debuggerAttempt.response,
         point: debuggerAttempt.point,
         elementAtPoint: debuggerAttempt.elementAtPoint,
-        elementAtPointIsCreateButton: debuggerAttempt.elementAtPointIsCreateButton
+        elementAtPointIsCreateButton: debuggerAttempt.elementAtPointIsCreateButton,
+        target: debuggerAttempt.target,
+        preClickTarget: debuggerAttempt.preClickTarget,
+        postClickTarget: debuggerAttempt.postClickTarget,
+        viewport: debuggerAttempt.viewport
       });
 
       lastSignals = await waitForCreateEffect(prompt, beforeMediaIds, 5000);
