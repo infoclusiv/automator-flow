@@ -304,6 +304,143 @@ async function dispatchDebuggerMouseClick(tabId, payload) {
   }
 }
 
+async function dispatchDebuggerMouseMove(tabId, payload) {
+  if (!tabId && tabId !== 0) {
+    throw makeError("DEBUGGER_TAB_NOT_FOUND", "No active tab id was available for debugger mouse move.", {
+      tabId
+    });
+  }
+
+  if (!chrome.debugger || typeof chrome.debugger.attach !== "function") {
+    throw makeError("DEBUGGER_API_UNAVAILABLE", "chrome.debugger API is unavailable. Check manifest permissions.", {});
+  }
+
+  const x = assertFiniteNumber(payload && payload.x, "x");
+  const y = assertFiniteNumber(payload && payload.y, "y");
+  const target = { tabId };
+  const startedAt = Date.now();
+  const preparedSession = payload && payload.prepared ? getTabSession(tabId) : null;
+  let attachInfo = preparedSession ? preparedSession.attachInfo : null;
+  let attachedForThisMove = false;
+  let detached = null;
+
+  try {
+    if (!preparedSession) {
+      attachInfo = await attachDebugger(target);
+      attachedForThisMove = Boolean(attachInfo && attachInfo.attachedNow);
+
+      if (!(payload && payload.skipBringToFront)) {
+        try {
+          await sendDebuggerCommand(target, "Page.bringToFront", {});
+        } catch (bringToFrontError) {
+          console.warn("FLOW_DEBUGGER_BRING_TO_FRONT_WARNING", bringToFrontError && bringToFrontError.message ? bringToFrontError.message : bringToFrontError);
+        }
+
+        await new Promise(function (resolve) {
+          setTimeout(resolve, 80);
+        });
+      }
+    }
+
+    await sendDebuggerCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x,
+      y,
+      button: "none",
+      buttons: 0,
+      clickCount: 0,
+      pointerType: "mouse"
+    });
+
+    const settleMs = Math.max(0, Number(payload && payload.settleMs) || 0);
+    if (settleMs) {
+      await new Promise(function (resolve) {
+        setTimeout(resolve, settleMs);
+      });
+    }
+
+    return {
+      ok: true,
+      method: "chrome.debugger/Input.dispatchMouseEvent.mouseMoved",
+      tabId,
+      x,
+      y,
+      prepared: Boolean(preparedSession),
+      attachInfo,
+      durationMs: Date.now() - startedAt
+    };
+  } finally {
+    const detachAfterMove = Boolean(payload && payload.detachAfterMove === true);
+
+    if (detachAfterMove) {
+      if (preparedSession) {
+        clearTabSession(tabId);
+        if (preparedSession.attachInfo && preparedSession.attachInfo.attachedNow) {
+          detached = await detachDebugger(target);
+        }
+      } else if (attachedForThisMove) {
+        detached = await detachDebugger(target);
+      }
+    } else if (!preparedSession && attachedForThisMove && !(payload && payload.keepAttached)) {
+      detached = await detachDebugger(target);
+    }
+
+    if (detached && !detached.ok) {
+      console.warn("FLOW_DEBUGGER_DETACH_WARNING", detached.warning);
+    }
+  }
+}
+
+function searchDownloads(payload) {
+  return new Promise(function (resolve, reject) {
+    if (!chrome.downloads || typeof chrome.downloads.search !== "function") {
+      reject(makeError("DOWNLOADS_API_UNAVAILABLE", "chrome.downloads API is unavailable. Check manifest permissions.", {}));
+      return;
+    }
+
+    const query = {
+      limit: Math.max(1, Number(payload && payload.limit) || 10),
+      orderBy: ["-startTime"]
+    };
+
+    if (payload && payload.startedAfter) {
+      query.startedAfter = payload.startedAfter;
+    }
+
+    chrome.downloads.search(query, function (items) {
+      const lastError = chrome.runtime.lastError;
+      if (lastError) {
+        reject(makeError("DOWNLOADS_SEARCH_FAILED", lastError.message || String(lastError), {
+          query
+        }));
+        return;
+      }
+
+      resolve({
+        ok: true,
+        query,
+        items: (items || []).map(function (item) {
+          return {
+            id: item.id,
+            url: item.url,
+            finalUrl: item.finalUrl,
+            filename: item.filename,
+            mime: item.mime,
+            state: item.state,
+            paused: item.paused,
+            danger: item.danger,
+            startTime: item.startTime,
+            endTime: item.endTime,
+            fileSize: item.fileSize,
+            totalBytes: item.totalBytes,
+            exists: item.exists
+          };
+        })
+      });
+    });
+  });
+}
+
 chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
   if (!message || !message.type) {
     return false;
@@ -359,6 +496,52 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
           error: {
             code: error && error.code ? error.code : "DEBUGGER_RELEASE_FAILED",
             message: error && error.message ? error.message : "Debugger release failed.",
+            details: error && error.details ? error.details : {}
+          }
+        });
+      });
+
+    return true;
+  }
+
+  if (message.type === "FLOW_DEBUGGER_MOUSE_MOVE") {
+    const tabId = sender && sender.tab ? sender.tab.id : null;
+
+    dispatchDebuggerMouseMove(tabId, message.payload || {})
+      .then(function (result) {
+        sendResponse({
+          ok: true,
+          payload: result
+        });
+      })
+      .catch(function (error) {
+        sendResponse({
+          ok: false,
+          error: {
+            code: error && error.code ? error.code : "DEBUGGER_MOUSE_MOVE_FAILED",
+            message: error && error.message ? error.message : "Debugger mouse move failed.",
+            details: error && error.details ? error.details : {}
+          }
+        });
+      });
+
+    return true;
+  }
+
+  if (message.type === "FLOW_DOWNLOADS_SEARCH") {
+    searchDownloads(message.payload || {})
+      .then(function (result) {
+        sendResponse({
+          ok: true,
+          payload: result
+        });
+      })
+      .catch(function (error) {
+        sendResponse({
+          ok: false,
+          error: {
+            code: error && error.code ? error.code : "DOWNLOADS_SEARCH_FAILED",
+            message: error && error.message ? error.message : "Downloads search failed.",
             details: error && error.details ? error.details : {}
           }
         });

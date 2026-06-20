@@ -1,10 +1,17 @@
 {
   "manifest_version": 3,
   "name": "Google Flow Automator MVP",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Automatiza prompt, generacion y descarga 1K en Google Flow.",
-  "permissions": ["activeTab", "storage", "debugger"],
-  "host_permissions": ["https://labs.google/*"],
+  "permissions": [
+    "activeTab",
+    "storage",
+    "debugger",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://labs.google/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
@@ -14,7 +21,9 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://labs.google/fx/tools/flow/project/*"],
+      "matches": [
+        "https://labs.google/fx/tools/flow/project/*"
+      ],
       "js": [
         "content/diagnostics.js",
         "content/dom-utils.js",

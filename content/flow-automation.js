@@ -921,9 +921,350 @@
     });
   }
 
+
+  function describePointHitForElement(targetElement, point) {
+    if (!point || !isPointInViewport(point.x, point.y)) {
+      return {
+        point,
+        pointInViewport: false,
+        elementAtPoint: null,
+        elementAtPointIsTarget: false
+      };
+    }
+
+    const elementAtPoint = document.elementFromPoint(point.x, point.y);
+    return {
+      point,
+      pointInViewport: true,
+      elementAtPoint: Diagnostics.describeElement(elementAtPoint),
+      elementAtPointIsTarget: Boolean(elementAtPoint && (elementAtPoint === targetElement || targetElement.contains(elementAtPoint)))
+    };
+  }
+
+  function getBestElementClickTarget(targetElement) {
+    if (!targetElement) {
+      return {
+        ok: false,
+        element: null,
+        point: null,
+        rect: null,
+        elementAtPoint: null,
+        elementAtPointIsTarget: false,
+        inspected: []
+      };
+    }
+
+    const rect = getElementRect(targetElement);
+    const points = buildCandidatePoints(targetElement).map(function (point) {
+      return describePointHitForElement(targetElement, point);
+    });
+    const hit = points.find(function (item) {
+      return item.elementAtPointIsTarget;
+    }) || null;
+
+    return {
+      ok: Boolean(hit),
+      element: targetElement,
+      point: hit ? hit.point : (points[0] ? points[0].point : null),
+      rect,
+      elementAtPoint: hit ? hit.elementAtPoint : (points[0] ? points[0].elementAtPoint : null),
+      elementAtPointIsTarget: Boolean(hit),
+      inspected: [{
+        element: Diagnostics.describeElement(targetElement),
+        rect,
+        usablePoint: hit ? hit.point : null,
+        elementAtUsablePoint: hit ? hit.elementAtPoint : null,
+        points
+      }]
+    };
+  }
+
+  function summarizeElementTarget(target) {
+    if (!target) {
+      return null;
+    }
+
+    return {
+      ok: Boolean(target.ok),
+      point: target.point || null,
+      rect: target.rect || null,
+      element: Diagnostics.describeElement(target.element),
+      elementAtPoint: target.elementAtPoint || null,
+      elementAtPointIsTarget: Boolean(target.elementAtPointIsTarget),
+      viewport: getViewportInfo(),
+      inspected: target.inspected || []
+    };
+  }
+
+  async function waitForFreshStableElementClickTarget(resolveElement, options) {
+    const startedAt = Date.now();
+    const timeoutMs = options && options.timeoutMs ? options.timeoutMs : 4000;
+    const intervalMs = options && options.intervalMs ? options.intervalMs : 90;
+    const requiredStableSamples = options && options.requiredStableSamples ? options.requiredStableSamples : 3;
+    const label = options && options.label ? options.label : "element";
+    const samples = [];
+    let lastKey = null;
+    let stableCount = 0;
+    let lastTarget = null;
+
+    await waitForLayoutFrames(2);
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const freshElement = resolveElement();
+      const target = getBestElementClickTarget(freshElement);
+      lastTarget = target;
+      const sampleKey = target && target.ok ? makeTargetKey(target) : "not-hittable";
+
+      samples.push({
+        time: new Date().toISOString(),
+        elapsedMs: Date.now() - startedAt,
+        label,
+        key: sampleKey,
+        target: summarizeElementTarget(target)
+      });
+
+      if (target && target.ok) {
+        if (sampleKey === lastKey) {
+          stableCount += 1;
+        } else {
+          lastKey = sampleKey;
+          stableCount = 1;
+        }
+
+        if (stableCount >= requiredStableSamples) {
+          await waitForLayoutFrames(1);
+          const finalElement = resolveElement();
+          const finalTarget = getBestElementClickTarget(finalElement);
+          const finalKey = finalTarget && finalTarget.ok ? makeTargetKey(finalTarget) : "not-hittable";
+
+          if (finalTarget && finalTarget.ok && finalKey === sampleKey) {
+            finalTarget.freshCoordinatePolicy = "requery-element-before-each-sample-and-final-reread-before-action";
+            finalTarget.label = label;
+            finalTarget.stableSamples = stableCount;
+            finalTarget.requiredStableSamples = requiredStableSamples;
+            finalTarget.durationMs = Date.now() - startedAt;
+            finalTarget.samples = samples.slice(-12);
+            finalTarget.finalKey = finalKey;
+            finalTarget.viewport = getViewportInfo();
+            return finalTarget;
+          }
+
+          samples.push({
+            time: new Date().toISOString(),
+            elapsedMs: Date.now() - startedAt,
+            label,
+            key: finalKey,
+            rejectedFinalReread: true,
+            target: summarizeElementTarget(finalTarget)
+          });
+
+          lastKey = finalKey;
+          stableCount = finalTarget && finalTarget.ok ? 1 : 0;
+        }
+      } else {
+        stableCount = 0;
+        lastKey = null;
+      }
+
+      await DomUtils.sleep(intervalMs);
+    }
+
+    if (lastTarget) {
+      lastTarget.freshCoordinatePolicy = "failed-to-find-stable-fresh-element-coordinate";
+      lastTarget.label = label;
+      lastTarget.stableSamples = stableCount;
+      lastTarget.requiredStableSamples = requiredStableSamples;
+      lastTarget.durationMs = Date.now() - startedAt;
+      lastTarget.samples = samples.slice(-20);
+      lastTarget.viewport = getViewportInfo();
+    }
+
+    return lastTarget;
+  }
+
+  async function prepareDebuggerForReason(reason, settleMs) {
+    const response = await chrome.runtime.sendMessage({
+      type: "FLOW_DEBUGGER_PREPARE",
+      payload: {
+        settleMs: typeof settleMs === "number" ? settleMs : 250,
+        reason: reason || "prepare-before-fresh-coordinate-measurement",
+        viewport: getViewportInfo()
+      }
+    });
+
+    if (!response || !response.ok) {
+      const error = new Error(response && response.error && response.error.message ? response.error.message : "Debugger prepare failed.");
+      error.code = response && response.error && response.error.code ? response.error.code : "DEBUGGER_PREPARE_FAILED";
+      error.details = response && response.error && response.error.details ? response.error.details : { response };
+      throw error;
+    }
+
+    return response;
+  }
+
+  async function sendDebuggerMouseMoveToTarget(target, details) {
+    const response = await chrome.runtime.sendMessage({
+      type: "FLOW_DEBUGGER_MOUSE_MOVE",
+      payload: {
+        x: target.point.x,
+        y: target.point.y,
+        prepared: true,
+        skipBringToFront: true,
+        keepAttached: true,
+        detachAfterMove: false,
+        settleMs: details && details.settleMs ? details.settleMs : 120,
+        targetElement: Diagnostics.describeElement(target.element),
+        elementAtPoint: target.elementAtPoint,
+        viewport: getViewportInfo(),
+        label: details && details.label ? details.label : target.label || null
+      }
+    });
+
+    return {
+      response,
+      point: target.point,
+      target,
+      viewport: getViewportInfo()
+    };
+  }
+
+  async function sendDebuggerClickToTarget(target, details) {
+    const response = await chrome.runtime.sendMessage({
+      type: "FLOW_DEBUGGER_CLICK",
+      payload: {
+        x: target.point.x,
+        y: target.point.y,
+        delayMs: details && details.delayMs ? details.delayMs : 120,
+        prepared: true,
+        skipBringToFront: true,
+        detachAfterClick: Boolean(details && details.detachAfterClick === true),
+        targetElement: Diagnostics.describeElement(target.element),
+        elementAtPoint: target.elementAtPoint,
+        viewport: getViewportInfo(),
+        label: details && details.label ? details.label : target.label || null
+      }
+    });
+
+    return {
+      response,
+      point: target.point,
+      target,
+      viewport: getViewportInfo()
+    };
+  }
+
+  async function searchDownloadsSince(startedAfter, limit) {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "FLOW_DOWNLOADS_SEARCH",
+        payload: {
+          startedAfter,
+          limit: limit || 10
+        }
+      });
+
+      return response || null;
+    } catch (error) {
+      return {
+        ok: false,
+        error: {
+          code: "DOWNLOADS_SEARCH_MESSAGE_FAILED",
+          message: error && error.message ? error.message : String(error)
+        }
+      };
+    }
+  }
+
+  async function waitForElement(resolveElement, options) {
+    const timeoutMs = options && options.timeoutMs ? options.timeoutMs : 8000;
+    const intervalMs = options && options.intervalMs ? options.intervalMs : 200;
+    const startedAt = Date.now();
+    let last = null;
+
+    while (Date.now() - startedAt < timeoutMs) {
+      last = resolveElement();
+      if (last) {
+        return {
+          element: last,
+          durationMs: Date.now() - startedAt
+        };
+      }
+
+      await DomUtils.sleep(intervalMs);
+    }
+
+    return {
+      element: null,
+      durationMs: Date.now() - startedAt
+    };
+  }
+
+  async function revealImageActions(ctx, target) {
+    const imageElement = target.element;
+    const card = FlowSelectors.findImageCardForImage(imageElement) || imageElement;
+
+    const imageTarget = await waitForFreshStableElementClickTarget(function () {
+      return imageElement;
+    }, {
+      timeoutMs: 3500,
+      intervalMs: 90,
+      requiredStableSamples: 3,
+      label: "generated-image"
+    });
+
+    const actionAttempts = [];
+
+    if (imageTarget && imageTarget.ok) {
+      const moveResult = await sendDebuggerMouseMoveToTarget(imageTarget, {
+        label: "hover-generated-image",
+        settleMs: 250
+      });
+      actionAttempts.push({
+        type: "move-image",
+        ok: Boolean(moveResult.response && moveResult.response.ok),
+        result: moveResult
+      });
+    }
+
+    await DomUtils.sleep(350);
+
+    let moreButton = FlowSelectors.findImageActionMoreButton() || FlowSelectors.findMoreButtonForImageCard(card);
+    if (moreButton) {
+      return {
+        moreButton,
+        card,
+        actionAttempts
+      };
+    }
+
+    // Fallback: some Flow layouts expose the image action bar only after selecting/opening the image.
+    if (imageTarget && imageTarget.ok) {
+      const clickResult = await sendDebuggerClickToTarget(imageTarget, {
+        label: "select-generated-image",
+        delayMs: 120,
+        detachAfterClick: false
+      });
+      actionAttempts.push({
+        type: "click-image",
+        ok: Boolean(clickResult.response && clickResult.response.ok),
+        result: clickResult
+      });
+
+      await DomUtils.sleep(900);
+      moreButton = FlowSelectors.findImageActionMoreButton() || FlowSelectors.findMoreButtonForImageCard(card);
+    }
+
+    return {
+      moreButton,
+      card,
+      actionAttempts
+    };
+  }
+
   async function downloadImage1K(ctx, images, options) {
     const imageIndex = options && typeof options.imageIndex === "number" ? options.imageIndex : 0;
     const target = images[imageIndex];
+    const debugAttempts = [];
 
     await ctx.emitProgress(Diagnostics.STEPS.SELECT_IMAGE, "running", "Seleccionando imagen generada...");
     if (!target) {
@@ -940,124 +1281,281 @@
 
     await ctx.emitProgress(Diagnostics.STEPS.SELECT_IMAGE, "success", "Imagen seleccionada.", {
       imageIndex,
-      selectedMediaId: target.mediaId
-    });
-
-    const imageElement = target.element;
-    const card = FlowSelectors.findImageCardForImage(imageElement);
-    if (!card) {
-      await ctx.throwStructuredError(
-        Diagnostics.ERROR_CODES.IMAGE_CARD_NOT_FOUND,
-        Diagnostics.STEPS.OPEN_IMAGE_MENU,
-        "No pude identificar la tarjeta contenedora de la imagen.",
-        {
-          selectedMediaId: target.mediaId,
-          image: Diagnostics.describeElement(imageElement)
-        }
-      );
-    }
-
-    await ctx.emitProgress(Diagnostics.STEPS.OPEN_IMAGE_MENU, "running", "Abriendo menu More...");
-    await DomUtils.hoverElement(card);
-    await DomUtils.hoverElement(imageElement);
-    await DomUtils.sleep(250);
-
-    const moreButton = FlowSelectors.findMoreButtonForImageCard(card);
-    if (!moreButton) {
-      await ctx.throwStructuredError(
-        Diagnostics.ERROR_CODES.IMAGE_MORE_MENU_NOT_FOUND,
-        Diagnostics.STEPS.OPEN_IMAGE_MENU,
-        "No encontre el boton More para la imagen seleccionada.",
-        {
-          selectedMediaId: target.mediaId,
-          card: Diagnostics.describeElement(card)
-        }
-      );
-    }
-
-    await DomUtils.clickElement(moreButton);
-    await ctx.emitProgress(Diagnostics.STEPS.OPEN_IMAGE_MENU, "success", "Menu More abierto.", {
       selectedMediaId: target.mediaId,
-      moreButtonFound: true
+      image: Diagnostics.describeElement(target.element)
     });
 
-    await ctx.emitProgress(Diagnostics.STEPS.OPEN_DOWNLOAD_SUBMENU, "running", "Abriendo submenu Download...");
-    const downloadMenuItem = await DomUtils.waitFor(function () {
-      return FlowSelectors.findDownloadMenuItem();
-    }, {
-      timeoutMs: 10000,
-      intervalMs: 200,
-      description: "download menu item"
-    }).catch(function () {
-      return null;
-    });
-
-    if (!downloadMenuItem) {
-      await ctx.throwStructuredError(
-        Diagnostics.ERROR_CODES.DOWNLOAD_MENU_NOT_FOUND,
-        Diagnostics.STEPS.OPEN_DOWNLOAD_SUBMENU,
-        "No encontre el submenu Download.",
-        {
-          selectedMediaId: target.mediaId
-        }
-      );
-    }
-
-    await DomUtils.hoverElement(downloadMenuItem);
-    downloadMenuItem.focus();
-    await DomUtils.sleep(250);
-
-    await ctx.emitProgress(Diagnostics.STEPS.OPEN_DOWNLOAD_SUBMENU, "success", "Submenu Download abierto.", {
-      downloadMenuFound: true,
-      selectedMediaId: target.mediaId
-    });
-
-    await ctx.emitProgress(Diagnostics.STEPS.CLICK_1K_ORIGINAL_SIZE, "running", "Haciendo click en 1K Original size...");
-    const originalSizeOption = await DomUtils.waitFor(function () {
-      return FlowSelectors.findOriginalSizeOption();
-    }, {
-      timeoutMs: 10000,
-      intervalMs: 200,
-      description: "1K Original size menu item"
-    }).catch(function () {
-      return null;
-    });
-
-    if (!originalSizeOption) {
-      await ctx.throwStructuredError(
-        Diagnostics.ERROR_CODES.ORIGINAL_SIZE_OPTION_NOT_FOUND,
-        Diagnostics.STEPS.CLICK_1K_ORIGINAL_SIZE,
-        "No encontre la opcion 1K Original size.",
-        {
-          selectedMediaId: target.mediaId
-        }
-      );
-    }
+    let debuggerPrepared = false;
 
     try {
-      await DomUtils.clickElement(originalSizeOption.closest("[role='menuitem']") || originalSizeOption);
-      await DomUtils.sleep((options && options.downloadTimeoutMs) || 3000);
+      const prepareResponse = await prepareDebuggerForReason("download-generated-image-1k", 250);
+      debuggerPrepared = true;
+      debugAttempts.push({
+        step: "prepare-debugger",
+        ok: Boolean(prepareResponse && prepareResponse.ok),
+        response: prepareResponse
+      });
+
+      await ctx.emitProgress(Diagnostics.STEPS.OPEN_IMAGE_MENU, "running", "Revelando acciones de imagen y buscando More...");
+      const revealResult = await revealImageActions(ctx, target);
+      debugAttempts.push({
+        step: "reveal-image-actions",
+        ok: Boolean(revealResult && revealResult.moreButton),
+        card: Diagnostics.describeElement(revealResult && revealResult.card),
+        actionAttempts: revealResult ? revealResult.actionAttempts : []
+      });
+
+      if (!revealResult || !revealResult.moreButton) {
+        await releaseDebuggerAfterFailedMeasurement("image-action-more-not-found");
+        debuggerPrepared = false;
+
+        await ctx.throwStructuredError(
+          Diagnostics.ERROR_CODES.IMAGE_ACTION_MORE_BUTTON_NOT_FOUND || Diagnostics.ERROR_CODES.IMAGE_MORE_MENU_NOT_FOUND,
+          Diagnostics.STEPS.OPEN_IMAGE_MENU,
+          "No encontre el boton More correcto de la imagen generada.",
+          {
+            selectedMediaId: target.mediaId,
+            image: Diagnostics.describeElement(target.element),
+            debugAttempts,
+            domSummary: buildDomSummary()
+          }
+        );
+      }
+
+      const moreTarget = await waitForFreshStableElementClickTarget(function () {
+        return FlowSelectors.findImageActionMoreButton() || FlowSelectors.findMoreButtonForImageCard(revealResult.card);
+      }, {
+        timeoutMs: 4500,
+        intervalMs: 90,
+        requiredStableSamples: 3,
+        label: "image-more-button"
+      });
+
+      if (!moreTarget || !moreTarget.ok) {
+        await releaseDebuggerAfterFailedMeasurement("image-more-coordinate-not-stable");
+        debuggerPrepared = false;
+
+        await ctx.throwStructuredError(
+          Diagnostics.ERROR_CODES.IMAGE_MORE_MENU_NOT_FOUND,
+          Diagnostics.STEPS.OPEN_IMAGE_MENU,
+          "No pude obtener coordenadas frescas y estables para el boton More de la imagen.",
+          {
+            selectedMediaId: target.mediaId,
+            moreTarget,
+            debugAttempts
+          }
+        );
+      }
+
+      const moreClick = await sendDebuggerClickToTarget(moreTarget, {
+        label: "click-image-more",
+        delayMs: 120,
+        detachAfterClick: false
+      });
+      debugAttempts.push({
+        step: "click-image-more",
+        ok: Boolean(moreClick.response && moreClick.response.ok),
+        result: moreClick
+      });
+
+      await ctx.emitProgress(Diagnostics.STEPS.OPEN_IMAGE_MENU, "success", "Menu More de imagen abierto.", {
+        selectedMediaId: target.mediaId,
+        moreButtonTarget: summarizeElementTarget(moreTarget),
+        debugAttempts: debugAttempts.slice(-4)
+      });
+
+      await ctx.emitProgress(Diagnostics.STEPS.OPEN_DOWNLOAD_SUBMENU, "running", "Buscando item Download en el menu de imagen...");
+      const downloadWait = await waitForElement(function () {
+        return FlowSelectors.findDownloadMenuItem();
+      }, {
+        timeoutMs: 8000,
+        intervalMs: 200
+      });
+
+      if (!downloadWait.element) {
+        await releaseDebuggerAfterFailedMeasurement("download-menu-item-not-found");
+        debuggerPrepared = false;
+
+        await ctx.throwStructuredError(
+          Diagnostics.ERROR_CODES.DOWNLOAD_MENU_NOT_FOUND,
+          Diagnostics.STEPS.OPEN_DOWNLOAD_SUBMENU,
+          "No encontre el item Download despues de abrir el menu More de la imagen.",
+          {
+            selectedMediaId: target.mediaId,
+            durationMs: downloadWait.durationMs,
+            debugAttempts,
+            domSummary: buildDomSummary()
+          }
+        );
+      }
+
+      const downloadTarget = await waitForFreshStableElementClickTarget(function () {
+        return FlowSelectors.findDownloadMenuItem();
+      }, {
+        timeoutMs: 4500,
+        intervalMs: 90,
+        requiredStableSamples: 3,
+        label: "download-menu-item"
+      });
+
+      if (!downloadTarget || !downloadTarget.ok) {
+        await releaseDebuggerAfterFailedMeasurement("download-menu-coordinate-not-stable");
+        debuggerPrepared = false;
+
+        await ctx.throwStructuredError(
+          Diagnostics.ERROR_CODES.DOWNLOAD_HOVER_FAILED || Diagnostics.ERROR_CODES.DOWNLOAD_MENU_NOT_FOUND,
+          Diagnostics.STEPS.OPEN_DOWNLOAD_SUBMENU,
+          "No pude obtener coordenadas frescas y estables para hacer hover sobre Download.",
+          {
+            selectedMediaId: target.mediaId,
+            downloadTarget,
+            debugAttempts
+          }
+        );
+      }
+
+      const downloadHover = await sendDebuggerMouseMoveToTarget(downloadTarget, {
+        label: "hover-download-menu-item",
+        settleMs: 700
+      });
+      debugAttempts.push({
+        step: "hover-download-menu-item",
+        ok: Boolean(downloadHover.response && downloadHover.response.ok),
+        result: downloadHover
+      });
+
+      await ctx.emitProgress(Diagnostics.STEPS.OPEN_DOWNLOAD_SUBMENU, "success", "Submenu Download abierto o solicitado por hover.", {
+        selectedMediaId: target.mediaId,
+        downloadTarget: summarizeElementTarget(downloadTarget),
+        debugAttempts: debugAttempts.slice(-5)
+      });
+
+      await ctx.emitProgress(Diagnostics.STEPS.CLICK_1K_ORIGINAL_SIZE, "running", "Buscando 1K Original size...");
+      const originalSizeWait = await waitForElement(function () {
+        return FlowSelectors.findOriginalSizeOption();
+      }, {
+        timeoutMs: 8000,
+        intervalMs: 200
+      });
+
+      if (!originalSizeWait.element) {
+        await releaseDebuggerAfterFailedMeasurement("original-size-option-not-found");
+        debuggerPrepared = false;
+
+        await ctx.throwStructuredError(
+          Diagnostics.ERROR_CODES.ORIGINAL_SIZE_OPTION_NOT_FOUND,
+          Diagnostics.STEPS.CLICK_1K_ORIGINAL_SIZE,
+          "No encontre la opcion 1K Original size despues de hacer hover en Download.",
+          {
+            selectedMediaId: target.mediaId,
+            durationMs: originalSizeWait.durationMs,
+            debugAttempts,
+            domSummary: buildDomSummary()
+          }
+        );
+      }
+
+      const originalSizeTarget = await waitForFreshStableElementClickTarget(function () {
+        return FlowSelectors.findOriginalSizeOption();
+      }, {
+        timeoutMs: 4500,
+        intervalMs: 90,
+        requiredStableSamples: 3,
+        label: "1k-original-size-option"
+      });
+
+      if (!originalSizeTarget || !originalSizeTarget.ok) {
+        await releaseDebuggerAfterFailedMeasurement("original-size-coordinate-not-stable");
+        debuggerPrepared = false;
+
+        await ctx.throwStructuredError(
+          Diagnostics.ERROR_CODES.ORIGINAL_SIZE_OPTION_NOT_FOUND,
+          Diagnostics.STEPS.CLICK_1K_ORIGINAL_SIZE,
+          "No pude obtener coordenadas frescas y estables para 1K Original size.",
+          {
+            selectedMediaId: target.mediaId,
+            originalSizeTarget,
+            debugAttempts
+          }
+        );
+      }
+
+      const downloadStartedAfter = new Date().toISOString();
+      const originalClick = await sendDebuggerClickToTarget(originalSizeTarget, {
+        label: "click-1k-original-size",
+        delayMs: 140,
+        detachAfterClick: true
+      });
+      debuggerPrepared = false;
+
+      debugAttempts.push({
+        step: "click-1k-original-size",
+        ok: Boolean(originalClick.response && originalClick.response.ok),
+        result: originalClick,
+        downloadStartedAfter
+      });
+
+      await DomUtils.sleep((options && options.downloadTimeoutMs) || 3500);
+
+      const downloadsSearch = await searchDownloadsSince(downloadStartedAfter, 10);
+      const downloadItems = downloadsSearch && downloadsSearch.payload && downloadsSearch.payload.items
+        ? downloadsSearch.payload.items
+        : [];
+
+      const matchingDownloads = downloadItems.filter(function (item) {
+        const text = [
+          item.filename || "",
+          item.url || "",
+          item.finalUrl || "",
+          item.mime || ""
+        ].join(" ");
+        return /image|png|jpeg|jpg|webp|media|getMediaUrlRedirect|google|flow/i.test(text);
+      });
+
+      await ctx.emitProgress(Diagnostics.STEPS.CLICK_1K_ORIGINAL_SIZE, "success", "Click real en 1K Original size ejecutado.", {
+        selectedMediaId: target.mediaId,
+        moreButtonFound: true,
+        downloadMenuFound: true,
+        originalSizeFound: true,
+        clicked: true,
+        originalSizeTarget: summarizeElementTarget(originalSizeTarget),
+        downloadsSearch,
+        matchingDownloads,
+        downloadConfirmed: matchingDownloads.length > 0,
+        debugAttempts: debugAttempts.slice(-8)
+      });
+
+      return {
+        element: target.element,
+        mediaId: target.mediaId,
+        downloadStartedAfter,
+        downloadsSearch,
+        matchingDownloads,
+        downloadConfirmed: matchingDownloads.length > 0
+      };
     } catch (error) {
+      if (debuggerPrepared) {
+        await releaseDebuggerAfterFailedMeasurement("download-flow-error");
+      }
+
+      if (error && error.step) {
+        throw error;
+      }
+
       await ctx.throwStructuredError(
         Diagnostics.ERROR_CODES.DOWNLOAD_CLICK_FAILED,
         Diagnostics.STEPS.CLICK_1K_ORIGINAL_SIZE,
-        "No pude activar la descarga 1K.",
+        "Fallo el flujo de descarga automatica 1K.",
         {
           selectedMediaId: target.mediaId,
-          originalSizeOption: Diagnostics.describeElement(originalSizeOption)
+          message: error && error.message ? error.message : String(error),
+          code: error && error.code ? error.code : null,
+          details: error && error.details ? error.details : {},
+          debugAttempts,
+          domSummary: buildDomSummary()
         }
       );
     }
-
-    await ctx.emitProgress(Diagnostics.STEPS.CLICK_1K_ORIGINAL_SIZE, "success", "Descarga 1K iniciada.", {
-      selectedMediaId: target.mediaId,
-      moreButtonFound: true,
-      downloadMenuFound: true,
-      originalSizeFound: true,
-      clicked: true
-    });
-
-    return target;
   }
 
   async function runGenerateAndDownload(config) {
@@ -1093,6 +1591,8 @@
       selectedImageIndex: config.options.imageIndex || 0,
       selectedMediaId: selectedImage.mediaId,
       downloadAction: "clicked_1k_original_size",
+      downloadConfirmed: Boolean(selectedImage.downloadConfirmed),
+      matchingDownloads: selectedImage.matchingDownloads || [],
       durationMs: new Date(diagnostics.endedAt).getTime() - new Date(diagnostics.startedAt).getTime(),
       diagnostics
     };
