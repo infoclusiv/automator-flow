@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flow Automator</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="app">
+      <section class="panel">
+        <label class="label" for="promptInput">Prompt</label>
+        <textarea id="promptInput" rows="7" placeholder="Describe la imagen que quieres generar"></textarea>
+        <div class="actions">
+          <button id="runButton" class="primary" type="button">Generar y descargar 1K</button>
+          <button id="copyDiagnosticsButton" type="button">Copiar diagnostico</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="status-row">
+          <span class="label">Estado</span>
+          <span id="flowBadge" class="badge neutral">Comprobando...</span>
+        </div>
+        <p id="statusMessage" class="status-message">Abre un proyecto de Google Flow para empezar.</p>
+      </section>
+
+      <section class="panel">
+        <div class="status-row">
+          <span class="label">Logs</span>
+          <span id="requestBadge" class="badge subtle">Sin ejecucion</span>
+        </div>
+        <div id="logList" class="logs" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
