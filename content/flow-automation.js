@@ -801,99 +801,145 @@
     const stableMs = options && options.stableMs ? options.stableMs : 2000;
     const startedAt = Date.now();
     const beforeSet = new Set(beforeMediaIds || []);
+    let settled = false;
+    let observer = null;
+    let intervalHandle = null;
+    let timeoutHandle = null;
+    let lastImageKey = null;
+    let stableSince = null;
+    let lastImages = [];
+    let lastInspection = null;
+
+    function collectNewImages() {
+      return FlowSelectors.findGeneratedImages()
+        .map(function (img) {
+          const src = img.getAttribute("src") || "";
+          const mediaId = DomUtils.getMediaIdFromUrl(src);
+          if (!mediaId || beforeSet.has(mediaId)) {
+            return null;
+          }
+
+          const rect = img.getBoundingClientRect();
+          return {
+            element: img,
+            mediaId,
+            src,
+            alt: img.getAttribute("alt") || "",
+            rect: {
+              x: Math.round(rect.x),
+              y: Math.round(rect.y),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height)
+            }
+          };
+        })
+        .filter(Boolean);
+    }
+
+    function buildImageKey(images) {
+      return images
+        .map(function (item) {
+          return [
+            item.mediaId,
+            item.rect.x,
+            item.rect.y,
+            item.rect.width,
+            item.rect.height
+          ].join(":");
+        })
+        .sort()
+        .join("|");
+    }
+
+    function cleanup() {
+      if (observer) {
+        observer.disconnect();
+      }
+      if (intervalHandle) {
+        clearInterval(intervalHandle);
+      }
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
+
+    async function completeSuccess(images, reason) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+
+      await ctx.emitProgress(Diagnostics.STEPS.WAIT_GENERATED_IMAGES, "success", "Imagenes nuevas detectadas.", {
+        beforeMediaIds,
+        newImagesFound: images.length,
+        newMediaIds: images.map(function (item) { return item.mediaId; }),
+        stabilityReason: reason || "stable",
+        lastInspection,
+        durationMs: Date.now() - startedAt
+      });
+
+      return images;
+    }
+
+    async function completeFailure(code, message, details) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+
+      await ctx.throwStructuredError(code, Diagnostics.STEPS.WAIT_GENERATED_IMAGES, message, details);
+    }
 
     return new Promise(function (resolve, reject) {
-      let settled = false;
-      let stableTimer = null;
-
-      function collectNewImages() {
-        return FlowSelectors.findGeneratedImages()
-          .map(function (img) {
-            const src = img.getAttribute("src") || "";
-            const mediaId = DomUtils.getMediaIdFromUrl(src);
-            if (!mediaId || beforeSet.has(mediaId)) {
-              return null;
-            }
-
-            const rect = img.getBoundingClientRect();
-            return {
-              element: img,
-              mediaId,
-              src,
-              alt: img.getAttribute("alt") || "",
-              rect: {
-                x: Math.round(rect.x),
-                y: Math.round(rect.y),
-                width: Math.round(rect.width),
-                height: Math.round(rect.height)
-              }
-            };
-          })
-          .filter(Boolean);
+      function settleWithSuccess(images, reason) {
+        completeSuccess(images, reason).then(resolve).catch(reject);
       }
 
-      async function completeSuccess(images) {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        observer.disconnect();
-        clearTimeout(timeoutHandle);
-        clearInterval(intervalHandle);
-        if (stableTimer) {
-          clearTimeout(stableTimer);
-        }
-
-        await ctx.emitProgress(Diagnostics.STEPS.WAIT_GENERATED_IMAGES, "success", "Imagenes nuevas detectadas.", {
-          beforeMediaIds,
-          newImagesFound: images.length,
-          newMediaIds: images.map(function (item) { return item.mediaId; }),
-          durationMs: Date.now() - startedAt
-        });
-        resolve(images);
-      }
-
-      async function completeFailure(code, message, details) {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        observer.disconnect();
-        clearTimeout(timeoutHandle);
-        clearInterval(intervalHandle);
-        if (stableTimer) {
-          clearTimeout(stableTimer);
-        }
-
-        try {
-          await ctx.throwStructuredError(code, Diagnostics.STEPS.WAIT_GENERATED_IMAGES, message, details);
-        } catch (error) {
-          reject(error);
-        }
-      }
-
-      function scheduleIfStable(images) {
-        if (!images.length) {
-          return;
-        }
-
-        if (stableTimer) {
-          clearTimeout(stableTimer);
-        }
-
-        stableTimer = setTimeout(function () {
-          completeSuccess(images);
-        }, stableMs);
+      function settleWithFailure(code, message, details) {
+        completeFailure(code, message, details).then(resolve).catch(reject);
       }
 
       function inspect() {
+        if (settled) {
+          return;
+        }
+
         const images = collectNewImages();
-        if (images.length) {
-          scheduleIfStable(images);
+        const now = Date.now();
+        const imageKey = buildImageKey(images);
+
+        lastImages = images;
+        lastInspection = {
+          time: new Date().toISOString(),
+          elapsedMs: now - startedAt,
+          imagesFound: images.length,
+          mediaIds: images.map(function (item) { return item.mediaId; }),
+          imageKey,
+          stableSinceElapsedMs: stableSince ? now - stableSince : null
+        };
+
+        if (!images.length) {
+          lastImageKey = null;
+          stableSince = null;
+          return;
+        }
+
+        if (imageKey !== lastImageKey) {
+          lastImageKey = imageKey;
+          stableSince = now;
+          return;
+        }
+
+        if (stableSince && now - stableSince >= stableMs) {
+          settleWithSuccess(images, "media-id-and-rect-stable");
         }
       }
 
-      const observer = new MutationObserver(inspect);
+      observer = new MutationObserver(inspect);
       observer.observe(document.body, {
         childList: true,
         subtree: true,
@@ -901,26 +947,36 @@
         attributeFilter: ["src", "style", "class", "aria-hidden"]
       });
 
-      const intervalHandle = setInterval(inspect, 500);
-      const timeoutHandle = setTimeout(function () {
-        const currentImages = collectNewImages();
-        const code = currentImages.length ? Diagnostics.ERROR_CODES.NO_NEW_GENERATED_IMAGES : Diagnostics.ERROR_CODES.GENERATION_TIMEOUT;
-        const message = currentImages.length
-          ? "Se detectaron cambios, pero no pude confirmar imagenes nuevas estables."
-          : "La generacion no produjo imagenes nuevas dentro del tiempo esperado.";
+      intervalHandle = setInterval(inspect, 500);
+      timeoutHandle = setTimeout(function () {
+        const images = collectNewImages();
 
-        completeFailure(code, message, {
-          beforeMediaIds,
-          currentMediaIds: FlowSelectors.getCurrentGeneratedMediaIds(),
-          createEffectSignals: collectCreateEffectSignals(null, beforeMediaIds),
-          durationMs: Date.now() - startedAt
-        });
+        // If a new media id exists at timeout, do not fail the workflow. The
+        // previous implementation kept resetting its stability timer on every
+        // interval, so it could wait 120 seconds even though the image already
+        // existed. At this point a new media id is enough to proceed to the
+        // download phase with a clear diagnostic reason.
+        if (images.length) {
+          settleWithSuccess(images, "new-media-found-timeout-fallback");
+          return;
+        }
+
+        settleWithFailure(
+          Diagnostics.ERROR_CODES.GENERATION_TIMEOUT,
+          "La generacion no produjo imagenes nuevas dentro del tiempo esperado.",
+          {
+            beforeMediaIds,
+            currentMediaIds: FlowSelectors.getCurrentGeneratedMediaIds(),
+            createEffectSignals: collectCreateEffectSignals(null, beforeMediaIds),
+            lastInspection,
+            durationMs: Date.now() - startedAt
+          }
+        );
       }, timeoutMs);
 
       inspect();
     });
   }
-
 
   function describePointHitForElement(targetElement, point) {
     if (!point || !isPointInViewport(point.x, point.y)) {
