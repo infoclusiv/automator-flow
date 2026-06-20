@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Google Flow Automator MVP",
-  "version": "0.1.4",
-  "description": "Automatiza prompt, generacion y descarga 1K en Google Flow.",
+  "version": "0.1.5",
+  "description": "Automatiza prompt, referencia local, generacion y descarga 1K en Google Flow.",
   "permissions": [
     "activeTab",
     "storage",

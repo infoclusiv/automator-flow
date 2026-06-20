@@ -1516,39 +1516,124 @@
     };
   }
 
-  async function waitForUploadedReferenceAsset(fileName, timeoutMs) {
+  function getVisibleReferenceMediaIds() {
+    if (FlowSelectors.getVisibleMediaIdsFromImages) {
+      return FlowSelectors.getVisibleMediaIdsFromImages();
+    }
+
+    const seen = {};
+    return Array.from(document.querySelectorAll("img"))
+      .filter(DomUtils.isVisible)
+      .map(function (img) {
+        return DomUtils.getMediaIdFromUrl(img.getAttribute("src") || "");
+      })
+      .filter(Boolean)
+      .filter(function (mediaId) {
+        if (seen[mediaId]) {
+          return false;
+        }
+        seen[mediaId] = true;
+        return true;
+      });
+  }
+
+  function getNewMediaIds(beforeMediaIds) {
+    const before = {};
+    (beforeMediaIds || []).forEach(function (mediaId) {
+      before[mediaId] = true;
+    });
+
+    return getVisibleReferenceMediaIds().filter(function (mediaId) {
+      return !before[mediaId];
+    });
+  }
+
+  async function waitForNewReferenceMediaId(beforeMediaIds, timeoutMs) {
     const startedAt = Date.now();
-    const fallbackName = stripExtension(fileName);
-    let lastAddToPromptButton = null;
-    let lastAsset = null;
+    let lastIds = [];
+    let stableMediaId = null;
+    let stableSince = 0;
 
-    while (Date.now() - startedAt < (timeoutMs || 65000)) {
-      lastAsset = FlowSelectors.findUploadedAssetByName ? (
-        FlowSelectors.findUploadedAssetByName(fileName) || FlowSelectors.findUploadedAssetByName(fallbackName)
-      ) : null;
-      lastAddToPromptButton = FlowSelectors.findAddToPromptButton ? FlowSelectors.findAddToPromptButton() : null;
+    while (Date.now() - startedAt < (timeoutMs || 70000)) {
+      const newIds = getNewMediaIds(beforeMediaIds);
+      lastIds = getVisibleReferenceMediaIds();
 
-      if (lastAsset) {
-        return {
-          asset: lastAsset,
-          addToPromptButton: lastAddToPromptButton,
-          durationMs: Date.now() - startedAt,
-          foundBy: "file-name"
-        };
+      if (newIds.length) {
+        const preferred = newIds[0];
+        if (stableMediaId !== preferred) {
+          stableMediaId = preferred;
+          stableSince = Date.now();
+        }
+
+        const asset = FlowSelectors.findReferenceAssetByMediaId
+          ? FlowSelectors.findReferenceAssetByMediaId(preferred)
+          : null;
+
+        if (asset && Date.now() - stableSince >= 900) {
+          return {
+            mediaId: preferred,
+            asset,
+            allNewMediaIds: newIds,
+            allVisibleMediaIds: lastIds,
+            durationMs: Date.now() - startedAt,
+            foundBy: "new-media-id-diff"
+          };
+        }
       }
 
-      // Do not use Add to Prompt availability alone as proof of upload.
-      // The reference panel can expose Add to Prompt before the just-uploaded file is visible,
-      // which could attach an older selected asset. We wait for the uploaded file name/prefix.
-
-      await DomUtils.sleep(500);
+      await DomUtils.sleep(350);
     }
 
     return {
-      asset: lastAsset,
-      addToPromptButton: lastAddToPromptButton,
+      mediaId: null,
+      asset: null,
+      allNewMediaIds: getNewMediaIds(beforeMediaIds),
+      allVisibleMediaIds: lastIds,
       durationMs: Date.now() - startedAt,
       foundBy: null
+    };
+  }
+
+  async function waitForReferenceAttached(mediaId, timeoutMs) {
+    const startedAt = Date.now();
+    let lastAttached = null;
+    let lastPanelOpen = null;
+
+    while (Date.now() - startedAt < (timeoutMs || 15000)) {
+      lastAttached = FlowSelectors.findAttachedReferenceByMediaId
+        ? FlowSelectors.findAttachedReferenceByMediaId(mediaId)
+        : null;
+      lastPanelOpen = FlowSelectors.isReferencePromptPanelOpen
+        ? FlowSelectors.isReferencePromptPanelOpen()
+        : Boolean(FlowSelectors.findAddToPromptButton && FlowSelectors.findAddToPromptButton());
+
+      if (lastAttached && !lastPanelOpen) {
+        return {
+          attached: true,
+          element: lastAttached,
+          panelClosed: true,
+          durationMs: Date.now() - startedAt
+        };
+      }
+
+      // In some UI states the panel close is slightly delayed; attachment is enough if it is clearly in the composer.
+      if (lastAttached && Date.now() - startedAt > 1500) {
+        return {
+          attached: true,
+          element: lastAttached,
+          panelClosed: !lastPanelOpen,
+          durationMs: Date.now() - startedAt
+        };
+      }
+
+      await DomUtils.sleep(250);
+    }
+
+    return {
+      attached: false,
+      element: lastAttached,
+      panelClosed: !lastPanelOpen,
+      durationMs: Date.now() - startedAt
     };
   }
 
@@ -1578,7 +1663,7 @@
     }
 
     try {
-      await ctx.emitProgress(Diagnostics.STEPS.OPEN_ADD_MEDIA, "running", "Abriendo Add Media para adjuntar imagen de referencia...", {
+      await ctx.emitProgress(Diagnostics.STEPS.OPEN_ADD_MEDIA, "running", "Abriendo el panel de referencia desde el + del compositor...", {
         fileName
       });
 
@@ -1592,40 +1677,30 @@
 
       const openResult = await openAddMediaPanel(ctx, debugAttempts);
       debugAttempts.push({
-        step: "open-add-media-panel",
+        step: "open-reference-panel-from-composer",
         ok: true,
         result: openResult
       });
 
-      await ctx.emitProgress(Diagnostics.STEPS.OPEN_ADD_MEDIA, "success", "Panel Add Media abierto.", {
+      await ctx.emitProgress(Diagnostics.STEPS.OPEN_ADD_MEDIA, "success", "Panel correcto con Add to Prompt detectado.", {
         fileName,
         openResult
       });
 
-      await ctx.emitProgress(Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE, "running", "Haciendo click en Upload media del panel de referencia...", {
+      const beforeMediaIds = getVisibleReferenceMediaIds();
+
+      await ctx.emitProgress(Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE, "running", "Subiendo imagen local por CDP sin abrir el explorador de Windows...", {
         fileName,
         referenceImagePath,
-        openMode: openResult && openResult.mode
-      });
-
-      const uploadClick = await clickReferencePanelUploadMedia(ctx, debugAttempts);
-      debugAttempts.push({
-        step: "reference-panel-upload-media-clicked",
-        ok: true,
-        uploadTarget: summarizeElementTarget(uploadClick.target)
-      });
-
-      await ctx.emitProgress(Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE, "running", "Subiendo imagen local de referencia con CDP en el input activado por el panel correcto...", {
-        fileName,
-        referenceImagePath
+        beforeMediaIds
       });
 
       const setFileResponse = await setDebuggerFileInputFiles(referenceImagePath, {
-        label: "set-local-reference-image-file-from-reference-panel",
-        settleMs: 1200
+        label: "set-local-reference-image-file-direct-without-file-chooser",
+        settleMs: 1500
       });
       debugAttempts.push({
-        step: "set-file-input-files",
+        step: "set-file-input-files-direct-no-file-chooser",
         ok: Boolean(setFileResponse && setFileResponse.ok),
         response: setFileResponse
       });
@@ -1637,116 +1712,136 @@
         result: tosResult
       });
 
-      const uploadWait = await waitForUploadedReferenceAsset(fileName, options && options.referenceUploadTimeoutMs ? options.referenceUploadTimeoutMs : 70000);
+      const uploadWait = await waitForNewReferenceMediaId(
+        beforeMediaIds,
+        options && options.referenceUploadTimeoutMs ? options.referenceUploadTimeoutMs : 70000
+      );
+
       debugAttempts.push({
-        step: "wait-uploaded-reference-asset",
-        ok: Boolean(uploadWait.asset),
+        step: "wait-new-reference-media-id",
+        ok: Boolean(uploadWait.mediaId),
         foundBy: uploadWait.foundBy,
         durationMs: uploadWait.durationMs,
-        asset: Diagnostics.describeElement(uploadWait.asset),
-        addToPromptButton: Diagnostics.describeElement(uploadWait.addToPromptButton)
+        mediaId: uploadWait.mediaId,
+        allNewMediaIds: uploadWait.allNewMediaIds,
+        allVisibleMediaIds: uploadWait.allVisibleMediaIds,
+        asset: Diagnostics.describeElement(uploadWait.asset)
       });
 
-      if (!uploadWait.asset) {
+      if (!uploadWait.mediaId || !uploadWait.asset) {
         await ctx.throwStructuredError(
           Diagnostics.ERROR_CODES.UPLOADED_REFERENCE_NOT_FOUND,
           Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE,
-          "La imagen local fue enviada al input del panel correcto, pero no pude confirmar que aparecio en la lista de assets por nombre o prefijo.",
+          "La imagen local fue enviada al input del panel correcto, pero no aparecio un nuevo mediaId visible para seleccionarla.",
           {
             fileName,
             referenceImagePath,
+            beforeMediaIds,
+            afterMediaIds: getVisibleReferenceMediaIds(),
             debugAttempts,
             domSummary: buildDomSummary()
           }
         );
       }
 
-      if (uploadWait.asset) {
-        const assetTarget = await waitForFreshStableElementClickTarget(function () {
-          return FlowSelectors.findUploadedAssetByName(fileName) || FlowSelectors.findUploadedAssetByName(stripExtension(fileName));
-        }, {
-          timeoutMs: 6000,
-          intervalMs: 90,
-          requiredStableSamples: 3,
-          label: "uploaded-reference-asset"
-        });
-
-        if (assetTarget && assetTarget.ok) {
-          const assetClick = await sendDebuggerClickToTarget(assetTarget, {
-            label: "click-uploaded-reference-asset",
-            delayMs: 120,
-            detachAfterClick: false
-          });
-          debugAttempts.push({
-            step: "click-uploaded-reference-asset",
-            ok: Boolean(assetClick.response && assetClick.response.ok),
-            result: assetClick
-          });
-          await DomUtils.sleep(500);
-        }
-      }
-
-      await ctx.emitProgress(Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE, "success", "Imagen de referencia subida o seleccionada.", {
+      await ctx.emitProgress(Diagnostics.STEPS.UPLOAD_REFERENCE_IMAGE, "success", "Imagen local subida y mediaId nuevo detectado.", {
         fileName,
+        referenceMediaId: uploadWait.mediaId,
         foundBy: uploadWait.foundBy,
         asset: Diagnostics.describeElement(uploadWait.asset),
-        debugAttempts: debugAttempts.slice(-6)
+        beforeMediaIds,
+        allNewMediaIds: uploadWait.allNewMediaIds
       });
 
-      await ctx.emitProgress(Diagnostics.STEPS.ADD_REFERENCE_TO_PROMPT, "running", "Agregando imagen de referencia al prompt...");
+      await ctx.emitProgress(Diagnostics.STEPS.ADD_REFERENCE_TO_PROMPT, "running", "Seleccionando el asset nuevo para adjuntarlo al prompt...", {
+        referenceMediaId: uploadWait.mediaId
+      });
 
-      const addToPromptTarget = await waitForFreshStableElementClickTarget(function () {
-        return FlowSelectors.findAddToPromptButton ? FlowSelectors.findAddToPromptButton() : null;
+      const assetTarget = await waitForFreshStableElementClickTarget(function () {
+        return FlowSelectors.findReferenceAssetByMediaId
+          ? FlowSelectors.findReferenceAssetByMediaId(uploadWait.mediaId)
+          : null;
       }, {
-        timeoutMs: 10000,
+        timeoutMs: 8000,
         intervalMs: 90,
         requiredStableSamples: 3,
-        label: "add-reference-to-prompt-button"
+        label: "new-reference-asset-by-media-id"
       });
 
-      if (!addToPromptTarget || !addToPromptTarget.ok) {
+      if (!assetTarget || !assetTarget.ok) {
         await ctx.throwStructuredError(
-          Diagnostics.ERROR_CODES.ADD_TO_PROMPT_BUTTON_NOT_FOUND,
+          Diagnostics.ERROR_CODES.REFERENCE_ASSET_NOT_VISIBLE,
           Diagnostics.STEPS.ADD_REFERENCE_TO_PROMPT,
-          "No encontre el boton Add to Prompt para adjuntar la imagen de referencia.",
+          "Detecte el mediaId nuevo, pero no pude obtener coordenadas estables del asset para seleccionarlo.",
           {
             fileName,
             referenceImagePath,
-            addToPromptTarget,
+            referenceMediaId: uploadWait.mediaId,
+            assetTarget,
             debugAttempts,
             domSummary: buildDomSummary()
           }
         );
       }
 
-      const addClick = await sendDebuggerClickToTarget(addToPromptTarget, {
-        label: "click-add-reference-to-prompt",
-        delayMs: 140,
+      const assetClick = await sendDebuggerClickToTarget(assetTarget, {
+        label: "click-new-reference-asset-by-media-id",
+        delayMs: 180,
         detachAfterClick: false
       });
+
       debugAttempts.push({
-        step: "click-add-reference-to-prompt",
-        ok: Boolean(addClick.response && addClick.response.ok),
-        result: addClick
+        step: "click-new-reference-asset-by-media-id",
+        ok: Boolean(assetClick.response && assetClick.response.ok),
+        target: summarizeElementTarget(assetTarget),
+        result: assetClick
       });
 
-      await DomUtils.sleep(1200);
+      const attachedWait = await waitForReferenceAttached(uploadWait.mediaId, 16000);
+
+      debugAttempts.push({
+        step: "wait-reference-attached-after-asset-click",
+        ok: Boolean(attachedWait.attached),
+        panelClosed: attachedWait.panelClosed,
+        durationMs: attachedWait.durationMs,
+        attachedElement: Diagnostics.describeElement(attachedWait.element)
+      });
+
+      if (!attachedWait.attached) {
+        await ctx.throwStructuredError(
+          Diagnostics.ERROR_CODES.REFERENCE_NOT_ATTACHED,
+          Diagnostics.STEPS.ADD_REFERENCE_TO_PROMPT,
+          "Seleccione el asset nuevo, pero no pude confirmar que quedo adjunto en el composer del prompt.",
+          {
+            fileName,
+            referenceImagePath,
+            referenceMediaId: uploadWait.mediaId,
+            attachedWait,
+            debugAttempts,
+            domSummary: buildDomSummary()
+          }
+        );
+      }
 
       await releaseDebuggerAfterFailedMeasurement("reference-image-attached");
       debuggerPrepared = false;
 
-      await ctx.emitProgress(Diagnostics.STEPS.ADD_REFERENCE_TO_PROMPT, "success", "Imagen de referencia agregada al prompt.", {
+      await ctx.emitProgress(Diagnostics.STEPS.ADD_REFERENCE_TO_PROMPT, "success", "Imagen de referencia adjunta al prompt.", {
         fileName,
         referenceImagePath,
-        addToPromptTarget: summarizeElementTarget(addToPromptTarget),
+        referenceMediaId: uploadWait.mediaId,
+        attachedElement: Diagnostics.describeElement(attachedWait.element),
+        panelClosed: attachedWait.panelClosed,
         debugAttempts: debugAttempts.slice(-8)
       });
 
       return {
         fileName,
         referenceImagePath,
+        referenceMediaId: uploadWait.mediaId,
         uploaded: true,
         addedToPrompt: true,
+        selectionMode: "new-media-id-diff",
         debugAttempts
       };
     } catch (error) {

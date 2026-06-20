@@ -541,6 +541,197 @@
     return best;
   }
 
+
+  function getVisibleMediaIdsFromImages() {
+    const seen = {};
+    return Array.from(document.querySelectorAll("img"))
+      .filter(DomUtils.isVisible)
+      .map(function (img) {
+        return DomUtils.getMediaIdFromUrl(img.getAttribute("src") || "");
+      })
+      .filter(Boolean)
+      .filter(function (mediaId) {
+        if (seen[mediaId]) {
+          return false;
+        }
+        seen[mediaId] = true;
+        return true;
+      });
+  }
+
+  function findImagesByMediaId(mediaId) {
+    if (!mediaId) {
+      return [];
+    }
+
+    return Array.from(document.querySelectorAll("img")).filter(function (img) {
+      return DomUtils.isVisible(img) &&
+        DomUtils.getMediaIdFromUrl(img.getAttribute("src") || "") === mediaId;
+    });
+  }
+
+  function expandToReferenceOptionTile(img) {
+    if (!img) {
+      return null;
+    }
+
+    let current = img;
+    let best = img;
+
+    for (let depth = 0; current && depth < 9; depth += 1) {
+      const role = current.getAttribute ? current.getAttribute("role") : null;
+      const text = textOf(current);
+      const rect = current.getBoundingClientRect();
+      const area = rect.width * rect.height;
+
+      if (role === "option" && DomUtils.isVisible(current)) {
+        return current;
+      }
+
+      if (
+        DomUtils.isVisible(current) &&
+        area >= 1000 &&
+        area <= 90000 &&
+        rect.width >= 40 &&
+        rect.height >= 30 &&
+        (/Image/i.test(text) || current.getAttribute("aria-selected") !== null)
+      ) {
+        best = current;
+      }
+
+      current = current.parentElement;
+    }
+
+    return best;
+  }
+
+  function findReferenceAssetByMediaId(mediaId) {
+    const images = findImagesByMediaId(mediaId);
+    if (!images.length) {
+      return null;
+    }
+
+    const candidates = images.map(function (img) {
+      const tile = expandToReferenceOptionTile(img) || img;
+      const rect = tile.getBoundingClientRect();
+      const text = textOf(tile);
+      let score = 0;
+
+      if (tile.getAttribute("role") === "option") {
+        score += 3000;
+      }
+
+      if (tile.getAttribute("aria-selected") !== null) {
+        score += 700;
+      }
+
+      if (/Image/i.test(text)) {
+        score += 500;
+      }
+
+      if (isCenterPointInteractable(tile)) {
+        score += 800;
+      }
+
+      if (rect.left > window.innerWidth * 0.45 && rect.width <= 360 && rect.height <= 90) {
+        score += 1600;
+      }
+
+      if (rect.width > 360 || rect.height > 220) {
+        score -= 1200;
+      }
+
+      return {
+        element: tile,
+        score,
+        text,
+        rect
+      };
+    }).filter(function (item) {
+      return item.element && DomUtils.isVisible(item.element);
+    });
+
+    if (!candidates.length) {
+      return null;
+    }
+
+    return candidates.sort(function (a, b) {
+      return b.score - a.score;
+    })[0].element || null;
+  }
+
+  function findAttachedReferenceByMediaId(mediaId) {
+    const editor = findPromptEditor();
+    const editorRect = editor ? editor.getBoundingClientRect() : null;
+    const images = findImagesByMediaId(mediaId);
+
+    if (!images.length) {
+      return null;
+    }
+
+    const candidates = images.map(function (img) {
+      let current = img;
+      let best = img;
+
+      for (let depth = 0; current && depth < 8; depth += 1) {
+        const text = textOf(current);
+        const rect = current.getBoundingClientRect();
+        const area = rect.width * rect.height;
+
+        if (
+          DomUtils.isVisible(current) &&
+          area >= 1000 &&
+          area <= 150000 &&
+          (/cancel|Clear prompt|What do you want to create/i.test(text) || (editorRect && Math.abs(rect.bottom - editorRect.top) < 140))
+        ) {
+          best = current;
+        }
+
+        current = current.parentElement;
+      }
+
+      const rect = best.getBoundingClientRect();
+      const text = textOf(best);
+      let score = 0;
+
+      if (/cancel/i.test(text)) {
+        score += 2500;
+      }
+
+      if (editorRect) {
+        const nearComposer = rect.bottom >= editorRect.top - 120 &&
+          rect.top <= editorRect.bottom + 120 &&
+          rect.left >= editorRect.left - 80 &&
+          rect.right <= editorRect.right + 120;
+
+        if (nearComposer) {
+          score += 2000;
+        }
+      }
+
+      if (rect.height <= 120 && rect.width >= 40) {
+        score += 400;
+      }
+
+      return {
+        element: best,
+        score,
+        text,
+        rect
+      };
+    }).filter(function (item) {
+      return item.element && DomUtils.isVisible(item.element);
+    });
+
+    if (!candidates.length) {
+      return null;
+    }
+
+    return candidates.sort(function (a, b) {
+      return b.score - a.score;
+    })[0].element || null;
+  }
+
   function findUploadedAssetByName(fileName) {
     const rawName = String(fileName || "").trim();
     if (!rawName) {
@@ -621,6 +812,9 @@
     findReferenceFileInputs,
     findIAgreeButton,
     findAddToPromptButton,
+    getVisibleMediaIdsFromImages,
+    findReferenceAssetByMediaId,
+    findAttachedReferenceByMediaId,
     findUploadedAssetByName,
     isAddMediaPanelOpen,
     isInViewport,
